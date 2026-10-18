@@ -1,0 +1,119 @@
+#!/bin/sh
+# claude-sessions: carry Claude Code session transcripts between the host and
+# min sessions. Host-only.
+#
+#   stage <project-path>          copy the project's newest transcripts into the
+#                                 stage dir the `claude` loadout patches into a
+#                                 session (as ~/.claude/projects/-workbench/)
+#   pull [<session>|--all]        copy transcripts written in a session back to
+#                                 the host project's ~/.claude/projects/<slug>/
+#
+# Inside a session the project lives at /workbench, so transcripts carry that
+# cwd; it is rewritten in both directions so each side sees its own path.
+
+set -u
+
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/claude-loadout
+PROJECTS=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects
+MAX_FILES=${CLAUDE_LOADOUT_HISTORY_MAX:-20}
+MAX_MB=${CLAUDE_LOADOUT_HISTORY_MB:-80}
+WORKBENCH=/workbench
+
+die() { echo "claude-sessions: $*" >&2; exit 1; }
+note() { echo "claude-sessions: $*" >&2; }
+
+slug_for() { printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g'; }
+
+# Rewrite the "cwd" field's path prefix: rewrite FROM TO < in > out
+rewrite() {
+    FROM=$1 TO=$2 perl -pe 's/"cwd":"\Q$ENV{FROM}\E(?=["\/])/"cwd":"$ENV{TO}/g'
+}
+
+cmd_stage() {
+    project=${1:?usage: claude-sessions stage <project-path>}
+    slug=$(slug_for "$project")
+    src=$PROJECTS/$slug
+    dst=$STATE/stage/$slug
+    rm -rf "$dst"
+    mkdir -p "$dst"
+    [ -d "$src" ] || return 0
+    budget=$((MAX_MB * 1024 * 1024))
+    n=0; total=0
+    # Newest first; stop at the file or byte cap.
+    for f in $(ls -t "$src"/*.jsonl 2>/dev/null); do
+        [ "$n" -lt "$MAX_FILES" ] || break
+        size=$(wc -c < "$f" | tr -d ' ')
+        [ $((total + size)) -le "$budget" ] || continue
+        rewrite "$project" "$WORKBENCH" < "$f" > "$dst/${f##*/}"
+        touch -r "$f" "$dst/${f##*/}"
+        n=$((n + 1)); total=$((total + size))
+    done
+    note "staged $n transcript(s), $((total / 1024 / 1024)) MB, for $slug"
+}
+
+# Emit "<id> <name> <project_path>" for sessions matching $1 (id, id prefix
+# or name), or all sessions when $1 is empty.
+sessions() {
+    min session list --json 2>/dev/null | jq -r --arg q "${1:-}" '
+        .sessions[]
+        | select($q == "" or .name == $q or (.id | startswith($q)))
+        | "\(.id) \(.name) \(.project_path)"'
+}
+
+pull_one() {
+    id=$1 name=$2 project=$3
+    slug=$(slug_for "$project")
+    dest=$PROJECTS/$slug
+    tmp=$(mktemp -d)
+    # shellcheck disable=SC2016
+    if ! min session exec "$id" \
+        'd=$HOME/.claude/projects/-workbench; [ -d "$d" ] || exit 3; tar -C "$d" --exclude=./memory -cf - .' \
+        2>/dev/null | tar -C "$tmp" -xf - 2>/dev/null; then
+        rm -rf "$tmp"
+        return 0
+    fi
+    mkdir -p "$dest"
+    n=0
+    for f in "$tmp"/*.jsonl; do
+        [ -f "$f" ] || continue
+        base=${f##*/}; uuid=${base%.jsonl}
+        rewrite "$WORKBENCH" "$project" < "$f" > "$f.host"
+        new=$(wc -c < "$f.host" | tr -d ' ')
+        old=0
+        [ -f "$dest/$base" ] && old=$(wc -c < "$dest/$base" | tr -d ' ')
+        [ "$new" -gt "$old" ] || continue
+        mv "$f.host" "$dest/$base"
+        if [ -d "$tmp/$uuid" ]; then
+            mkdir -p "$dest/$uuid"
+            cp -R "$tmp/$uuid/." "$dest/$uuid/"
+        fi
+        n=$((n + 1))
+    done
+    rm -rf "$tmp"
+    [ "$n" -eq 0 ] || note "pulled $n transcript(s) from $name into $slug"
+}
+
+cmd_pull() {
+    command -v jq >/dev/null || die "jq is required"
+    case ${1:-} in
+        --all) q= ;;
+        '')
+            here=$(pwd -P)
+            top=$(git rev-parse --show-toplevel 2>/dev/null) || top=$here
+            sessions | while read -r id name project; do
+                [ "$project" = "$here" ] || [ "$project" = "$top" ] || continue
+                pull_one "$id" "$name" "$project"
+            done
+            return 0 ;;
+        *) q=$1 ;;
+    esac
+    sessions "$q" | while read -r id name project; do
+        pull_one "$id" "$name" "$project"
+    done
+}
+
+case ${1:-} in
+    stage) shift; cmd_stage "$@" ;;
+    pull)  shift; cmd_pull "$@" ;;
+    *) echo "usage: claude-sessions stage <project-path> | pull [<session>|--all]" >&2; exit 2 ;;
+esac

@@ -1,0 +1,28 @@
+#!/bin/sh
+# Wraps the packaged claude: after an interactive session ends, offer to
+# review the memories it wrote. Everything else passes straight through.
+self=$(cd "$(dirname "$0")" && pwd)/${0##*/}
+real=
+IFS=:
+for d in $PATH; do
+    [ -x "$d/claude" ] || continue
+    [ "$d/claude" -ef "$self" ] && continue
+    real=$d/claude; break
+done
+unset IFS
+[ -n "$real" ] || { echo "claude: packaged claude not found on PATH" >&2; exit 127; }
+
+interactive=1
+case ${1:-} in
+    mcp|plugin|plugins|config|update|doctor|install|setup-token|auth|agents|-v|--version|-h|--help) interactive= ;;
+esac
+for a in "$@"; do
+    case $a in -p|--print) interactive= ;; esac
+done
+[ -t 0 ] && [ -t 1 ] || interactive=
+[ -n "$interactive" ] || exec "$real" "$@"
+
+"$real" "$@"
+rc=$?
+"$HOME/.local/bin/claude-mem" review --if-pending
+exit $rc
