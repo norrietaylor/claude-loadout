@@ -43,16 +43,18 @@ if [ -z "$linked" ]; then
     say "memory: local copy only (set CLAUDE_LOADOUT_MEMORY_REMOTE on the host to sync)"
 fi
 
-# --- onboarding and workspace trust, merged into whatever is there (the
-# broker loadout may already have registered MCP servers in this file).
+# --- onboarding, and workspace trust only when asked for: trusting
+# /workbench runs the project's own .claude hooks and MCP servers without a
+# prompt, with this session's credentials. Merged into whatever is there
+# (the broker loadout may already have registered MCP servers in this file).
 cj=$HOME/.claude.json
 [ -s "$cj" ] || echo '{}' > "$cj"
 ver=$(claude --version 2>/dev/null | awk '{print $1}')
-if jq --arg v "${ver:-0}" '
+if jq --arg v "${ver:-0}" --arg trust "${CLAUDE_LOADOUT_TRUST_WORKBENCH:-}" '
     .hasCompletedOnboarding = true
     | .lastOnboardingVersion = (.lastOnboardingVersion // $v)
-    | .projects["/workbench"].hasTrustDialogAccepted = true
     | .projects["/workbench"].hasCompletedProjectOnboarding = true
+    | if $trust == "1" then .projects["/workbench"].hasTrustDialogAccepted = true else . end
 ' "$cj" > "$cj.tmp"; then
     mv "$cj.tmp" "$cj"
 else

@@ -46,12 +46,14 @@ CLAUDE_LOADOUT_CLAUDE_MD     = { inherit = true, default = ".claude/CLAUDE.md" }
 CLAUDE_LOADOUT_SETTINGS      = { inherit = true, default = ".config/minimal/loadouts/claude/settings.default.json" }
 CLAUDE_LOADOUT_OUTPUT_STYLES = { inherit = true, default = ".claude/output-styles" }
 CLAUDE_LOADOUT_SKILLS        = { inherit = true, default = ".claude/skills" }
+# "1" pre-accepts the workspace trust prompt for /workbench.
+CLAUDE_LOADOUT_TRUST_WORKBENCH = { inherit = true, default = "" }
 
 [[lifecycle_hooks]]
 description = "claude: memory repo + link, onboarding/trust, plugins"
 on_activate = { type = "external", value = "./hooks/on-activate.sh", timeout = 240 }
 
 [[lifecycle_hooks]]
-description = "claude: push unreviewed memories to pending/<session>"
+description = "claude: send kept and unreviewed memories to pending/<session>/<slug>"
 on_detach  = { type = "external", value = "./hooks/on-teardown.sh", timeout = 45 }
 on_destroy = { type = "external", value = "./hooks/on-teardown.sh", timeout = 45 }

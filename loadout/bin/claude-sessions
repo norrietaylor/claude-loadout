@@ -10,6 +10,10 @@
 #
 # Inside a session the project lives at /workbench, so transcripts carry that
 # cwd; it is rewritten in both directions so each side sees its own path.
+#
+# What comes back from a session is untrusted: only plain files are taken, a
+# transcript the host already has is only ever extended, never rewritten, and
+# the whole pull is capped at CLAUDE_LOADOUT_PULL_MB.
 
 set -u
 
@@ -17,6 +21,7 @@ STATE=${XDG_STATE_HOME:-$HOME/.local/state}/claude-loadout
 PROJECTS=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects
 MAX_FILES=${CLAUDE_LOADOUT_HISTORY_MAX:-20}
 MAX_MB=${CLAUDE_LOADOUT_HISTORY_MB:-80}
+PULL_MB=${CLAUDE_LOADOUT_PULL_MB:-512}
 WORKBENCH=/workbench
 
 die() { echo "claude-sessions: $*" >&2; exit 1; }
@@ -60,32 +65,61 @@ sessions() {
         | "\(.id) \(.name) \(.project_path)"'
 }
 
+# install SRC DEST: take the session's copy when the host has none, or when
+# it extends the host's byte for byte (transcripts are append-only).
+# Anything else would rewrite history the host already has.
+install_if_extends() {
+    if [ -e "$2" ]; then
+        old=$(wc -c < "$2" | tr -d ' ')
+        new=$(wc -c < "$1" | tr -d ' ')
+        [ "$new" -gt "$old" ] || return 1
+        if ! head -c "$old" "$1" | cmp -s - "$2"; then
+            note "${2#"$PROJECTS"/}: session copy does not extend the host's; kept the host's"
+            return 1
+        fi
+    fi
+    mkdir -p "${2%/*}"
+    mv "$1" "$2"
+}
+
 pull_one() {
     id=$1 name=$2 project=$3
     slug=$(slug_for "$project")
     dest=$PROJECTS/$slug
+    cap=$((PULL_MB * 1024 * 1024))
     tmp=$(mktemp -d)
     # shellcheck disable=SC2016
-    if ! min session exec "$id" \
+    min session exec "$id" \
         'd=$HOME/.claude/projects/-workbench; [ -d "$d" ] || exit 3; tar -C "$d" --exclude=./memory -cf - .' \
-        2>/dev/null | tar -C "$tmp" -xf - 2>/dev/null; then
-        rm -rf "$tmp"
-        return 0
+        2>/dev/null | head -c $((cap + 1)) > "$tmp/x.tar"
+    size=$(wc -c < "$tmp/x.tar" | tr -d ' ')
+    if [ "$size" -gt "$cap" ]; then
+        note "$name: transcripts exceed $PULL_MB MB; not pulled (raise CLAUDE_LOADOUT_PULL_MB)"
+        rm -rf "$tmp"; return 0
     fi
-    mkdir -p "$dest"
+    mkdir "$tmp/x"
+    if [ "$size" -eq 0 ] || ! tar -C "$tmp/x" -xf "$tmp/x.tar" 2>/dev/null; then
+        rm -rf "$tmp"; return 0
+    fi
+    # Plain files and directories only: a link here would make the copies
+    # below read or write outside these dirs. Sizes are rechecked because a
+    # sparse archive member can expand far beyond the archive.
+    if [ -n "$(find "$tmp/x" ! -type f ! -type d | head -1)" ] \
+        || [ -n "$(find "$tmp/x" -type f -size +"$cap"c | head -1)" ]; then
+        note "$name: archive holds links, special or oversized files; not pulled"
+        rm -rf "$tmp"; return 0
+    fi
     n=0
-    for f in "$tmp"/*.jsonl; do
+    for f in "$tmp"/x/*.jsonl; do
         [ -f "$f" ] || continue
         base=${f##*/}; uuid=${base%.jsonl}
+        case $uuid in ''|*[!A-Za-z0-9-]*) continue ;; esac
         rewrite "$WORKBENCH" "$project" < "$f" > "$f.host"
-        new=$(wc -c < "$f.host" | tr -d ' ')
-        old=0
-        [ -f "$dest/$base" ] && old=$(wc -c < "$dest/$base" | tr -d ' ')
-        [ "$new" -gt "$old" ] || continue
-        mv "$f.host" "$dest/$base"
-        if [ -d "$tmp/$uuid" ]; then
-            mkdir -p "$dest/$uuid"
-            cp -R "$tmp/$uuid/." "$dest/$uuid/"
+        install_if_extends "$f.host" "$dest/$base" || continue
+        if [ -d "$tmp/x/$uuid" ]; then
+            (cd "$tmp/x/$uuid" && find . -type f) | while IFS= read -r r; do
+                install_if_extends "$tmp/x/$uuid/$r" "$dest/$uuid/${r#./}"
+            done
         fi
         n=$((n + 1))
     done

@@ -4,13 +4,15 @@
 #   min session activate   stages the project's recent transcripts, links its
 #                          memory dir into the memory repo, and hands the
 #                          loadout its vars (CLAUDE_LOADOUT_SLUG, _MEMORY_REMOTE)
-#   min session attach     pulls new transcripts and memories back when you
-#                          detach
-#   min session destroy    pulls transcripts first, then recovers memories the
-#                          session stashed unreviewed (as pending, here)
+#   min session attach     pulls new transcripts back when you detach, and
+#                          moves memories the session sent into the review
+#                          inbox (claude-mem review)
+#   min session destroy    the same, around the destroy
 #
 # Memory sync is on when CLAUDE_LOADOUT_MEMORY_REPO names a local clone of
 # your memory repo; its origin becomes the remote the session clones.
+# Nothing a session pushes is taken without a check: `claude-mem sync` takes
+# only signed upstream commits, and `recover` lands in the inbox.
 
 : ${CLAUDE_LOADOUT_BIN:=${XDG_CONFIG_HOME:-$HOME/.config}/minimal/loadouts/claude/bin}
 path=("$CLAUDE_LOADOUT_BIN" ${path:#$CLAUDE_LOADOUT_BIN})
@@ -49,10 +51,19 @@ _claude_loadout_session() {
     done
 }
 
-_claude_loadout_memory_pull() {
+# The session's name, for a name or id prefix.
+_claude_loadout_session_name() {
+    [[ -n $1 ]] || return 0
+    command min session list --json 2>/dev/null | jq -r --arg q "$1" \
+        '[.sessions[] | select(.name == $q or (.id | startswith($q)))][0].name // empty'
+}
+
+# Take signed memory commits, publish ours, and move what the session sent
+# into the inbox: after attach returns (detach sent it) and after destroy.
+_claude_loadout_memory_in() {
     [[ -n ${CLAUDE_LOADOUT_MEMORY_REPO:-} ]] || return 0
-    git -C "$CLAUDE_LOADOUT_MEMORY_REPO" pull -q --rebase --autostash 2>/dev/null \
-        || print -u2 "claude-loadout: could not pull $CLAUDE_LOADOUT_MEMORY_REPO"
+    claude-mem sync
+    [[ -n $1 ]] && claude-mem recover "$@"
 }
 
 min() {
@@ -68,39 +79,43 @@ min() {
             claude-sessions stage "$proj"
             if [[ -n ${CLAUDE_LOADOUT_MEMORY_REPO:-} ]]; then
                 CLAUDE_LOADOUT_SLUG=$slug claude-mem link "$slug" >/dev/null
-                remote=$(git -C "$CLAUDE_LOADOUT_MEMORY_REPO" remote get-url origin 2>/dev/null)
-                _claude_loadout_memory_pull
-                git -C "$CLAUDE_LOADOUT_MEMORY_REPO" push -q 2>/dev/null
+                # Never hand the session credentials embedded in the URL.
+                remote=$(git -C "$CLAUDE_LOADOUT_MEMORY_REPO" remote get-url origin 2>/dev/null \
+                    | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#')
+                claude-mem sync
                 local n=$(CLAUDE_LOADOUT_SLUG=$slug claude-mem status --porcelain 2>/dev/null | wc -l)
                 (( n > 0 )) && print -u2 "claude-loadout: ${n// /} unreviewed host memories for this project stay on the host (claude-mem review)"
             fi
             CLAUDE_LOADOUT_SLUG=$slug CLAUDE_LOADOUT_MEMORY_REMOTE=$remote command min "$@"
             ;;
         attach)
+            local s=$(_claude_loadout_session "${@:3}")
             command min "$@"; rc=$?
-            claude-sessions pull "$(_claude_loadout_session "${@:3}")"
-            _claude_loadout_memory_pull
+            claude-sessions pull "$s"
+            local name=$(_claude_loadout_session_name "$s")
+            _claude_loadout_memory_in ${name:+--session} $name
             return $rc
             ;;
         destroy)
-            local s= name= prefix=
+            local s= name= all=
             if [[ " ${*:3} " == *" --all "* ]]; then
+                all=1
                 claude-sessions pull --all
             else
                 s=$(_claude_loadout_session "${@:3}")
                 if [[ -n $s ]]; then
                     claude-sessions pull "$s"
-                    name=$(command min session list --json 2>/dev/null | jq -r --arg q "$s" \
-                        '[.sessions[] | select(.name == $q or (.id | startswith($q)))][0].name // empty')
-                    prefix=${name:+$name-}
+                    name=$(_claude_loadout_session_name "$s")
                 fi
             fi
             command min "$@"; rc=$?
-            # The destroy hook stashed whatever was never reviewed; bring it
-            # back here as pending.
-            if (( rc == 0 )) && [[ -n ${CLAUDE_LOADOUT_MEMORY_REPO:-} ]]; then
-                _claude_loadout_memory_pull
-                [[ -n $name || " ${*:3} " == *" --all "* ]] && claude-mem recover "$prefix"
+            # The destroy hook sent whatever was never reviewed.
+            if (( rc == 0 )); then
+                if [[ -n $all ]]; then
+                    _claude_loadout_memory_in --all
+                else
+                    _claude_loadout_memory_in ${name:+--session} $name
+                fi
             fi
             return $rc
             ;;

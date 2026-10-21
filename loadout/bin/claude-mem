@@ -5,22 +5,32 @@
 #   $CLAUDE_LOADOUT_MEMORY_REPO/$CLAUDE_LOADOUT_MEMORY_SUBDIR/projects/<slug>/
 # and Claude's own memory dir (~/.claude/projects/<slug>/memory, or
 # -workbench/memory inside a min session) is a symlink to it. Anything
-# uncommitted there is "pending": `keep` commits and pushes it, `discard`
-# throws it away. Git is only ever asked about paths under the memory subdir,
-# so unrelated work in the same repo is never committed.
+# uncommitted there is "pending" until it is kept or discarded.
+#
+# Only the host publishes to the repo's branch. A session reaches GitHub with
+# the same credential, so nothing server-side can stop it pushing there;
+# instead the host signs its commits, and `sync` refuses any upstream commit
+# to a checked-out path that is not signed by a key in the host-only
+# allowed-signers file. Inside a session, `keep` commits locally and sends
+# the result to pending/<session>/<slug>. `recover` on the host copies those
+# branches into an inbox outside every live memory dir, and `review` there
+# decides what reaches the repo.
 #
 # Runs on the host and inside a session (POSIX sh, git; no jq).
 
 set -u
 
 SUBDIR=${CLAUDE_LOADOUT_MEMORY_SUBDIR:-memory}
+IN_SESSION=${CLAUDE_LOADOUT_IN_SESSION:-}
 if [ -n "${CLAUDE_LOADOUT_MEMORY_REPO:-}" ]; then
     REPO=$CLAUDE_LOADOUT_MEMORY_REPO
-elif [ -n "${CLAUDE_LOADOUT_IN_SESSION:-}" ]; then
+elif [ -n "$IN_SESSION" ]; then
     REPO=$HOME/.claude-memory
 else
     REPO=
 fi
+INBOX=${XDG_STATE_HOME:-$HOME/.local/state}/claude-loadout/inbox
+SIGNERS=${XDG_CONFIG_HOME:-$HOME/.config}/claude-loadout/allowed_signers
 
 die() { echo "claude-mem: $*" >&2; exit 1; }
 note() { echo "claude-mem: $*" >&2; }
@@ -34,6 +44,7 @@ else
     top=$(git rev-parse --show-toplevel 2>/dev/null) || top=$PWD
     SLUG=$(slug_for "$top")
 fi
+SESSION=$(printf '%s' "${MINIMAL_SESSION_NAME:-$(hostname -s 2>/dev/null || echo host)}" | sed 's/[^A-Za-z0-9_-]/_/g')
 
 REL=$SUBDIR/projects/$SLUG      # repo-relative project memory dir
 DIR=$REPO/$REL
@@ -42,17 +53,34 @@ need_repo() {
     [ -n "$REPO" ] || die "CLAUDE_LOADOUT_MEMORY_REPO is not set"
     git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || die "$REPO is not a git repo"
 }
+host_only() { [ -z "$IN_SESSION" ] || die "$1 is host-only"; }
 
 g() { git -C "$REPO" "$@"; }
 
-# Pending topic files (MEMORY.md excluded), one "<X> <name>" per line, where X
-# is A (new), M (modified) or D (deleted).
+# Memory files are flat *.md names Claude writes; anything else (spaces,
+# globs, subdirectories, dotfiles) is never kept, discarded or recovered.
+valid_name() {
+    case $1 in
+        .*|*[!A-Za-z0-9._-]*) return 1 ;;
+        ?*.md) return 0 ;;
+    esac
+    return 1
+}
+
+# Control characters made visible, so a memory cannot hide text from review
+# behind terminal escapes.
+clean() { LC_ALL=C tr '\000-\010\013-\037\177' '?'; }
+page() {
+    if [ -t 1 ] && command -v less >/dev/null 2>&1; then less -FX; else cat; fi
+}
+
+# Pending files, MEMORY.md included, one "<X> <name>" per line, where X is A
+# (new), M (modified) or D (deleted).
 pending() {
-    g status --porcelain=v1 -uall -- "$REL" 2>/dev/null | while IFS= read -r line; do
+    g status --porcelain=v1 -uall --no-renames -- "$REL" 2>/dev/null | while IFS= read -r line; do
         code=$(printf '%s' "$line" | cut -c1-2)
-        path=$(printf '%s' "$line" | cut -c4-)
-        name=${path#"$REL"/}
-        [ "$name" = MEMORY.md ] && continue
+        name=$(printf '%s' "$line" | cut -c4-)
+        name=${name#"$REL"/}
         case $code in
             '??'|A?) x=A ;;
             ?D|D?)   x=D ;;
@@ -62,36 +90,60 @@ pending() {
     done
 }
 
-index_dirty() { [ -n "$(g status --porcelain=v1 -- "$REL/MEMORY.md" 2>/dev/null)" ]; }
+# Host: memories sessions sent for this project, awaiting review.
+inbox_names() {
+    [ -d "$INBOX/$SLUG" ] || return 0
+    ls "$INBOX/$SLUG" | while IFS= read -r n; do
+        valid_name "$n" && printf '%s\n' "$n"
+    done
+}
 
-# Resolve the file arguments of keep/discard into names, or every pending one
-# for --all.
+# Resolve the file arguments of keep/discard/diff into valid names, or every
+# valid pending one for --all.
 targets() {
     if [ "${1:-}" = --all ]; then
-        pending | cut -c3-
-    else
-        for f in "$@"; do printf '%s\n' "${f##*/}"; done
+        pending | cut -c3- | while IFS= read -r n; do
+            valid_name "$n" && printf '%s\n' "$n"
+        done
+        return 0
     fi
+    for f in "$@"; do
+        if valid_name "$f"; then printf '%s\n' "$f"; else note "skipping '$f': not a memory file name"; fi
+    done
 }
 
 cmd_status() {
     need_repo
     p=$(pending)
-    if [ -z "$p" ] && ! index_dirty; then
-        [ "${1:-}" = --porcelain ] || echo "No pending memories for $SLUG."
-        return 0
-    fi
+    i=$(inbox_names)
     if [ "${1:-}" = --porcelain ]; then
-        printf '%s\n' "$p" | sed '/^$/d'
+        [ -z "$p" ] || printf '%s\n' "$p"
+        [ -z "$i" ] || printf '%s\n' "$i" | sed 's/^/I /'
         return 0
     fi
-    echo "Pending memories in $DIR:"
-    printf '%s\n' "$p" | sed '/^$/d' | while read -r x name; do
-        case $x in A) l=new ;; M) l=modified ;; D) l=deleted ;; esac
-        desc=$(sed -n 's/^description: *//p' "$DIR/$name" 2>/dev/null | head -1)
-        printf '  %-9s %s%s\n' "$l" "$name" "${desc:+  — $desc}"
-    done
-    index_dirty && echo "  (MEMORY.md index also changed)"
+    if [ -z "$p" ] && [ -z "$i" ]; then
+        echo "No pending memories for $SLUG."
+        return 0
+    fi
+    if [ -n "$p" ]; then
+        echo "Pending memories in $DIR:"
+        printf '%s\n' "$p" | while read -r x name; do
+            case $x in A) l=new ;; M) l=modified ;; D) l=deleted ;; esac
+            if valid_name "$name"; then
+                desc=$(sed -n 's/^description: *//p' "$DIR/$name" 2>/dev/null | head -1 | clean)
+            else
+                desc="ignored: not a memory file name"
+            fi
+            printf '  %-9s %s%s\n' "$l" "$name" "${desc:+  — $desc}"
+        done
+    fi
+    if [ -n "$i" ]; then
+        echo "Sent from sessions, awaiting review (claude-mem review):"
+        for n in $i; do
+            [ -e "$INBOX/$SLUG/$n.kept" ] && k="  (kept in the session)" || k=
+            printf '  %s%s\n' "$n" "$k"
+        done
+    fi
     return 0
 }
 
@@ -100,23 +152,20 @@ cmd_diff() {
     [ $# -gt 0 ] || set -- --all
     for name in $(targets "$@"); do
         if g ls-files --error-unmatch -- "$REL/$name" >/dev/null 2>&1; then
-            g --no-pager diff -- "$REL/$name"
+            g --no-pager diff --no-color -- "$REL/$name"
         elif [ -f "$DIR/$name" ]; then
             echo "=== new: $name"
             cat "$DIR/$name"
             echo
         fi
-    done
+    done | clean
 }
 
-# Pending names not in the space-separated list $1.
-pending_except() {
-    pending | cut -c3- | while IFS= read -r n; do
-        case " $1 " in
-            (*" $n "*) ;;
-            (*) echo "$n" ;;
-        esac
-    done
+# Host commits must be signed, or another host would refuse them.
+signing_ready() {
+    [ "$(g config gpg.format)" = ssh ] && [ -n "$(g config user.signingkey)" ] \
+        && [ "$(g config --bool commit.gpgsign)" = true ] \
+        && [ "$(g config gpg.ssh.allowedSignersFile)" = "$SIGNERS" ] && [ -s "$SIGNERS" ]
 }
 
 cmd_keep() {
@@ -124,19 +173,20 @@ cmd_keep() {
     no_push=
     [ "${1:-}" = --no-push ] && { no_push=1; shift; }
     [ $# -gt 0 ] || die "usage: claude-mem keep [--no-push] <file>... | --all"
+    [ -n "$IN_SESSION" ] || signing_ready || die "memory commits are not signed yet; run: claude-mem setup"
     names=$(targets "$@" | tr '\n' ' '); names=${names% }
+    [ -n "$names" ] || { echo "Nothing to keep."; return 0; }
     set --
     for name in $names; do set -- "$@" "$REL/$name"; done
-    # The index goes in with the last kept file, so the committed MEMORY.md
-    # never points at a memory that is still only pending.
-    if [ -z "$(pending_except "$names")" ] && index_dirty; then
-        set -- "$@" "$REL/MEMORY.md"
-    fi
-    [ $# -gt 0 ] || { echo "Nothing to keep."; return 0; }
-    g add -A -- "$@" && g commit -q --only -m "memory($SLUG): keep ${names:-index}" -- "$@" \
+    g add -A -- "$@" && g commit -q --only -m "memory($SLUG): keep $names" -- "$@" \
         || die "commit failed"
-    echo "Kept: ${names:-MEMORY.md}"
-    [ -n "$no_push" ] || cmd_push
+    if [ -n "$IN_SESSION" ]; then
+        echo "Kept: $names (sent to the host, which publishes it after its own review)"
+        cmd_stash
+    else
+        echo "Kept: $names"
+        [ -n "$no_push" ] || cmd_sync
+    fi
 }
 
 cmd_discard() {
@@ -149,7 +199,7 @@ cmd_discard() {
         else
             rm -f "$DIR/$name"
             # Drop the index line pointing at a memory that no longer exists.
-            [ -f "$DIR/MEMORY.md" ] && {
+            [ "$name" != MEMORY.md ] && [ -f "$DIR/MEMORY.md" ] && {
                 grep -v -F "($name)" "$DIR/MEMORY.md" > "$DIR/MEMORY.md.tmp"
                 mv "$DIR/MEMORY.md.tmp" "$DIR/MEMORY.md"
             }
@@ -162,109 +212,221 @@ cmd_discard() {
     return 0
 }
 
+ask() {
+    while :; do
+        printf '[k]eep  [d]iscard  [s]kip  [q]uit > ' >&2
+        read -r ans < /dev/tty || ans=q
+        case $ans in
+            k|K) echo k; return ;;
+            d|D) echo d; return ;;
+            s|S|'') echo s; return ;;
+            q|Q) echo q; return ;;
+        esac
+    done
+}
+
 cmd_review() {
     need_repo
     if [ "${1:-}" = --if-pending ]; then
-        [ -n "$(pending)" ] || return 0
+        [ -n "$(pending)$(inbox_names)" ] || return 0
         [ -t 0 ] && [ -t 1 ] || { note "pending memories left for later: claude-mem review"; return 0; }
     fi
-    p=$(pending)
-    [ -n "$p" ] || { echo "No pending memories for $SLUG."; return 0; }
-    keep=; drop=
+    p=$(targets --all)
+    i=$(inbox_names)
+    [ -n "$p$i" ] || { echo "No pending memories for $SLUG."; return 0; }
+    keep=; drop=; quit=
     echo "Review new Claude memories for $SLUG"
-    for name in $(printf '%s\n' "$p" | cut -c3-); do
+    # Memories sessions sent: reviewed here before they touch the live dir.
+    for name in $i; do
+        f=$INBOX/$SLUG/$name
+        [ -e "$f.kept" ] && k=", kept there" || k=
+        echo
+        echo "────────── $name  (from a session$k)"
+        {
+            if [ -f "$DIR/$name" ]; then diff -u "$DIR/$name" "$f"; else cat "$f"; fi
+            [ -f "$f.index" ] && { echo; echo "MEMORY.md line: $(cat "$f.index")"; }
+        } | clean | page
+        case $(ask) in
+            k)  mkdir -p "$DIR"
+                cp "$f" "$DIR/$name"
+                if [ -f "$f.index" ] && ! grep -qxF -f "$f.index" "$DIR/MEMORY.md" 2>/dev/null; then
+                    cat "$f.index" >> "$DIR/MEMORY.md"
+                fi
+                rm -f "$f" "$f.kept" "$f.index"
+                keep="$keep $name" ;;
+            d)  rm -f "$f" "$f.kept" "$f.index" ;;
+            q)  quit=1; break ;;
+        esac
+    done
+    # Then what was written here, MEMORY.md included.
+    [ -n "$quit" ] || for name in $(targets --all); do
+        case " $keep " in *" $name "*) continue ;; esac
         echo
         echo "────────── $name"
-        cmd_diff "$name" | head -40
-        while :; do
-            printf '[k]eep  [d]iscard  [s]kip  [q]uit > '
-            read -r ans < /dev/tty || ans=q
-            case $ans in
-                k|K) keep="$keep $name"; break ;;
-                d|D) drop="$drop $name"; break ;;
-                s|S|'') break ;;
-                q|Q) break 2 ;;
-            esac
-        done
+        cmd_diff "$name" | page
+        case $(ask) in
+            k) keep="$keep $name" ;;
+            d) drop="$drop $name" ;;
+            q) break ;;
+        esac
     done
     [ -n "$drop" ] && cmd_discard $drop
     [ -n "$keep" ] && cmd_keep $keep
-    rest=$(pending)
-    [ -n "$rest" ] && echo "Still pending: $(printf '%s\n' "$rest" | cut -c3- | tr '\n' ' ')"
+    rest=$(cmd_status --porcelain | cut -c3- | tr '\n' ' ')
+    [ -n "$rest" ] && echo "Still pending: $rest"
     return 0
 }
 
-# Commit everything pending to pending/<name> on the remote without touching
-# the working tree or the current branch: a safety net for teardown, when no
-# one is there to review.
+# Send kept and pending memories to pending/<session>/<slug> without touching
+# the working tree: what `keep` does in a session, and the teardown safety
+# net when no one is there to review.
 cmd_stash() {
     need_repo
-    name=${MINIMAL_SESSION_NAME:-$(hostname -s 2>/dev/null || echo host)}-$SLUG
-    if [ -z "$(pending)" ] && ! index_dirty; then
-        # Nothing left to save: drop an older stash so a later recover cannot
-        # bring back memories that were since kept or discarded.
-        g push -q origin ":refs/heads/pending/$name" >/dev/null 2>&1
+    b=pending/$SESSION/$SLUG
+    up=$(g rev-parse -q --verify '@{u}' 2>/dev/null) || up=
+    if [ -z "$(pending)" ] && [ "$(g rev-parse HEAD)" = "$up" ]; then
+        # Nothing left to send: drop an older branch so a later recover
+        # cannot bring back memories that were since discarded.
+        g push -q origin ":refs/heads/$b" >/dev/null 2>&1
         return 0
     fi
-    idx=$(mktemp)
-    trap 'rm -f "$idx"' EXIT
-    GIT_INDEX_FILE=$idx g read-tree HEAD || return 1
-    GIT_INDEX_FILE=$idx g add -A -- "$REL" || return 1
-    tree=$(GIT_INDEX_FILE=$idx g write-tree) || return 1
-    commit=$(g commit-tree "$tree" -p HEAD -m "memory($SLUG): unreviewed, stashed from $name") || return 1
-    if g push -q -f origin "$commit:refs/heads/pending/$name" >/dev/null 2>&1; then
-        echo "claude-mem: stashed unreviewed memories to pending/$name"
+    commit=HEAD
+    if [ -n "$(pending)" ]; then
+        idx=$(mktemp)
+        trap 'rm -f "$idx"' EXIT
+        GIT_INDEX_FILE=$idx g read-tree HEAD || return 1
+        GIT_INDEX_FILE=$idx g add -A -- "$REL" || return 1
+        tree=$(GIT_INDEX_FILE=$idx g write-tree) || return 1
+        commit=$(g commit-tree "$tree" -p HEAD -m "claude-mem stash: unreviewed memories from $SESSION") || return 1
+    fi
+    if g push -q -f origin "$commit:refs/heads/$b" >/dev/null 2>&1; then
+        echo "claude-mem: sent memories to $b for review on the host"
     else
-        note "stash push failed; memories remain only in $DIR"
+        note "push to $b failed; memories remain only in $DIR"
     fi
 }
 
-# Host: bring stashed memories (pending/<prefix>*) back into the working tree
-# as pending, then delete the branches. New files are restored, index lines
-# are merged in; anything the host already has is left alone.
-cmd_recover() {
-    need_repo
-    prefix=${1:-}
-    g fetch -q --prune origin "+refs/heads/pending/*:refs/remotes/origin/pending/*" 2>/dev/null || return 0
-    for ref in $(g for-each-ref --format='%(refname)' "refs/remotes/origin/pending/$prefix*"); do
-        b=${ref#refs/remotes/origin/}
-        n=0
-        for f in $(g diff --name-only --diff-filter=AM HEAD "$ref" -- "$SUBDIR/projects"); do
-            case $f in
-                */MEMORY.md)
-                    mkdir -p "$REPO/${f%/*}"
-                    g show "$ref:$f" | while IFS= read -r line; do
-                        grep -qxF -- "$line" "$REPO/$f" 2>/dev/null || printf '%s\n' "$line" >> "$REPO/$f"
-                    done ;;
-                *)
-                    # An edit to an existing memory applies only if neither
-                    # side has changed it since the stash was taken.
-                    if [ -e "$REPO/$f" ]; then
-                        g diff --quiet HEAD -- "$f" || continue
-                        [ "$(g rev-parse -q --verify "$ref^:$f")" = "$(g rev-parse -q --verify "HEAD:$f")" ] || continue
-                    fi
-                    mkdir -p "$REPO/${f%/*}"
-                    g show "$ref:$f" > "$REPO/$f" && n=$((n + 1)) ;;
-            esac
+# Host: copy one file a session changed into the inbox. Only flat *.md files
+# stored as plain blobs are taken, and they land under $INBOX, never in a
+# live memory dir. A MEMORY.md contributes just its new lines, each filed
+# beside the memory it points at.
+inbox_one() {
+    ref=$1 base=$2 kept=$3 f=$4
+    rel=${f#"$SUBDIR"/projects/}
+    s=${rel%%/*}; name=${rel#*/}
+    case $s in ''|*[!A-Za-z0-9-]*) note "ignored $f"; return 0 ;; esac
+    valid_name "$name" || { note "ignored $f"; return 0; }
+    [ "$(g ls-tree "$ref" -- "$f" | cut -d' ' -f1)" = 100644 ] \
+        || { note "ignored $f: not a regular file"; return 0; }
+    d=$INBOX/$s
+    mkdir -p "$d"
+    if [ "$name" = MEMORY.md ]; then
+        old=$(mktemp)
+        g show "$base:$f" > "$old" 2>/dev/null
+        g show "$ref:$f" | while IFS= read -r line; do
+            grep -qxF -- "$line" "$old" && continue
+            t=$(printf '%s\n' "$line" | sed -n 's/.*](\([^)]*\)).*/\1/p')
+            valid_name "$t" && [ "$t" != MEMORY.md ] && printf '%s\n' "$line" > "$d/$t.index"
         done
-        g push -q origin ":refs/heads/$b" >/dev/null 2>&1
-        g update-ref -d "$ref"
-        echo "claude-mem: recovered $n unreviewed memories from $b (claude-mem review)"
-    done
+        rm -f "$old"
+        return 0
+    fi
+    g show "$ref:$f" > "$d/$name.tmp" || { rm -f "$d/$name.tmp"; return 0; }
+    # Already identical to the host's copy (sent again by a later stash).
+    if cmp -s "$d/$name.tmp" "$REPO/$f"; then rm -f "$d/$name.tmp"; return 0; fi
+    mv "$d/$name.tmp" "$d/$name"
+    g diff --quiet "$base" "$kept" -- "$f" || : > "$d/$name.kept"
 }
 
-cmd_push() {
+cmd_recover() {
     need_repo
-    g push -q 2>/dev/null && return 0
-    g pull -q --rebase --autostash && g push -q && return 0
-    note "push failed; commits are local in $REPO (run: claude-mem push)"
-    return 1
+    host_only recover
+    case ${1:-} in
+        --all) pat=refs/remotes/origin/pending ;;
+        --session)
+            [ -n "${2:-}" ] || die "usage: claude-mem recover --session <name> | --all"
+            pat=refs/remotes/origin/pending/$(printf '%s' "$2" | sed 's/[^A-Za-z0-9_-]/_/g') ;;
+        *) die "usage: claude-mem recover --session <name> | --all" ;;
+    esac
+    g fetch -q --prune origin "+refs/heads/pending/*:refs/remotes/origin/pending/*" 2>/dev/null || return 0
+    # for-each-ref matches a pattern whole or up to a slash, so a session
+    # name never matches another that merely starts with it.
+    for ref in $(g for-each-ref --format='%(refname)' "$pat"); do
+        b=${ref#refs/remotes/origin/}
+        base=$(g merge-base HEAD "$ref" 2>/dev/null) \
+            || { note "$b shares no history with $REPO; left on the remote"; continue; }
+        kept=$ref
+        case $(g log -1 --format=%s "$ref") in "claude-mem stash:"*) kept=$ref^ ;; esac
+        g diff --name-only --no-renames --diff-filter=AM "$base" "$ref" -- "$SUBDIR/projects" \
+            | while IFS= read -r f; do inbox_one "$ref" "$base" "$kept" "$f"; done
+        g push -q origin ":refs/heads/$b" >/dev/null 2>&1
+        g update-ref -d "$ref"
+        echo "claude-mem: recovered $b into the review inbox (claude-mem review)"
+    done
+    # Index lines whose memory never arrived (or was already identical).
+    [ -d "$INBOX" ] && find "$INBOX" -name '*.md.index' | while IFS= read -r x; do
+        [ -f "${x%.index}" ] || rm -f "$x"
+    done
+    return 0
+}
+
+# Paths the host's checkout materialises: everything, or the sparse set plus
+# top-level files (cone mode always checks those out).
+checked_out_paths() {
+    [ "$(g config --bool core.sparseCheckout)" = true ] || return 0
+    g sparse-checkout list
+    echo ':(glob)*'
+}
+
+# Host: take upstream only if every new commit touching a checked-out path is
+# signed by an allowed key, then publish local commits.
+cmd_sync() {
+    need_repo
+    host_only sync
+    signing_ready || { note "memory commits are not signed yet; run: claude-mem setup"; return 1; }
+    g fetch -q origin || { note "fetch failed; nothing synced"; return 1; }
+    up=$(g rev-parse -q --verify '@{u}') || { note "no upstream branch in $REPO"; return 1; }
+    set --
+    while IFS= read -r p; do set -- "$@" "$p"; done <<EOF
+$(checked_out_paths)
+EOF
+    [ -n "${1:-}" ] || set --
+    bad=$(g log --format='%h %G? %an: %s' "HEAD..$up" -- "$@" | awk '$2 != "G"')
+    if [ -n "$bad" ]; then
+        note "not taking $up: these commits change checked-out files without a signature from $SIGNERS"
+        printf '  %s\n' "$bad" >&2
+        note "inspect them (git -C $REPO log -p HEAD..$up). If they are yours: git -C $REPO merge --ff-only $up"
+        note "if not, put the remote back: git -C $REPO push --force-with-lease=HEAD:$up origin HEAD"
+        return 1
+    fi
+    g rebase -q --autostash "$up" >/dev/null 2>&1 \
+        || { g rebase --abort >/dev/null 2>&1; note "rebase onto $up failed; resolve in $REPO"; return 1; }
+    g push -q 2>/dev/null || { note "push failed; commits are local in $REPO (claude-mem sync)"; return 1; }
+}
+
+# Host: sign memory commits with an SSH key and trust it for sync.
+cmd_setup() {
+    need_repo
+    host_only setup
+    key=${1:-${CLAUDE_LOADOUT_SIGNING_KEY:-$HOME/.ssh/id_ed25519.pub}}
+    [ -f "$key" ] || die "no SSH public key at $key (claude-mem setup <key.pub>)"
+    email=$(g config user.email) || die "set git user.email first"
+    mkdir -p "${SIGNERS%/*}"
+    line="$email namespaces=\"git\" $(cut -d' ' -f1,2 "$key")"
+    grep -qxF -- "$line" "$SIGNERS" 2>/dev/null || printf '%s\n' "$line" >> "$SIGNERS"
+    g config gpg.format ssh
+    g config user.signingkey "$key"
+    g config commit.gpgsign true
+    g config gpg.ssh.allowedSignersFile "$SIGNERS"
+    echo "memory commits in $REPO are signed with $key"
+    echo "trusted signers: $SIGNERS (add your other hosts' keys there)"
 }
 
 # Host only: make ~/.claude/projects/<slug>/memory a symlink into the repo,
-# migrating whatever is there first.
+# migrating whatever is there first. Migrated files are pending until
+# reviewed, or committed (not pushed) with --commit.
 link_one() {
-    s=$1
+    s=$1 commit=$2
     host=$HOME/.claude/projects/$s/memory
     target=$REPO/$SUBDIR/projects/$s
     if [ -L "$host" ]; then
@@ -285,11 +447,13 @@ link_one() {
         bak=${XDG_STATE_HOME:-$HOME/.local/state}/claude-loadout/memory-backup/$s-$(date +%Y%m%d%H%M%S)
         mkdir -p "$(dirname "$bak")"
         mv "$host" "$bak"
-        # These were already in use, so they come in as committed, not as
-        # pending memories to review.
         r=$SUBDIR/projects/$s
         if [ -n "$(g status --porcelain=v1 -uall -- "$r")" ]; then
-            g add -A -- "$r" && g commit -q --only -m "memory($s): import from host" -- "$r"
+            if [ -n "$commit" ]; then
+                g add -A -- "$r" && g commit -q --only -m "memory($s): import from host" -- "$r"
+            else
+                note "$s: existing memories imported as pending (claude-mem review)"
+            fi
         fi
     fi
     ln -s "$target" "$host"
@@ -298,30 +462,34 @@ link_one() {
 
 cmd_link() {
     need_repo
-    [ -z "${CLAUDE_LOADOUT_IN_SESSION:-}" ] || die "link is host-only"
+    host_only link
+    commit=
+    [ "${1:-}" = --commit ] && { commit=1; shift; }
+    [ -z "$commit" ] || signing_ready || die "memory commits are not signed yet; run: claude-mem setup"
     if [ "${1:-}" = --all ]; then
         for d in "$HOME"/.claude/projects/*/memory; do
             [ -d "$d" ] || continue
             [ -n "$(ls -A "$d" 2>/dev/null)" ] || continue
-            s=${d%/memory}; link_one "${s##*/}"
+            s=${d%/memory}; link_one "${s##*/}" "$commit"
         done
     else
-        link_one "${1:-$SLUG}"
+        link_one "${1:-$SLUG}" "$commit"
     fi
 }
 
 usage() {
     cat <<EOF
 usage: claude-mem <command>
-  status [--porcelain]          list pending memories for this project
+  status [--porcelain]          list pending memories (and, on the host, the session inbox)
   diff [file...]                show pending changes
-  keep [--no-push] <file>...|--all   commit (and push) pending memories
+  keep [--no-push] <file>...|--all   host: commit and publish; session: commit and send to the host
   discard <file>...|--all       drop pending memories (and their index lines)
   review [--if-pending]         interactive keep/discard
-  stash                         push pending to pending/<session>-<slug> without committing locally
-  recover [<session>]           host: restore stashed pending/* memories as pending, delete branches
-  push                          push committed memories
-  link [<slug>|--all]           host: symlink ~/.claude/projects/<slug>/memory into the repo
+  stash                         send kept and pending memories to pending/<session>/<slug>
+  recover --session <name>|--all  host: copy pending/* branches into the review inbox, delete them
+  sync                          host: take signed upstream commits, publish local ones
+  setup [<key.pub>]             host: sign memory commits with an SSH key and trust it
+  link [--commit] [<slug>|--all]   host: symlink ~/.claude/projects/<slug>/memory into the repo
 project: $SLUG
 repo:    ${REPO:-<unset>}
 EOF
@@ -336,7 +504,8 @@ case $cmd in
     review)  cmd_review "$@" ;;
     stash)   cmd_stash ;;
     recover) cmd_recover "$@" ;;
-    push)    cmd_push ;;
+    sync)    cmd_sync ;;
+    setup)   cmd_setup "$@" ;;
     link)    cmd_link "$@" ;;
     -h|--help|help) usage ;;
     *) usage >&2; exit 2 ;;
