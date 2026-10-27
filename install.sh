@@ -4,9 +4,10 @@
 #   install.sh [--no-init]   copy loadout/ into Minimal's loadouts dir, set up
 #                            the state remote (claude-state init, unless
 #                            --no-init), sign memory commits (claude-mem
-#                            setup, if not yet), and register the host Claude
-#                            Code hooks in settings.json
-#   install.sh --uninstall   remove those hooks only; the loadout stays
+#                            setup, if not yet), link claude-mem and
+#                            claude-state into ~/.local/bin, and register the
+#                            host Claude Code hooks in settings.json
+#   install.sh --uninstall   remove those links and hooks; the loadout stays
 #
 # The loadout target must be a real directory: Minimal refuses hook scripts
 # reached through a symlink. Loadouts are read at activation, so re-run this
@@ -101,7 +102,30 @@ merge_hooks() {    # $1 = install | uninstall
     [ "$real" = "$settings" ] || echo "note: $settings links to $real; commit the change there"
 }
 
+# claude-mem and claude-state on the host's PATH, as links into the loadout.
+# A file of that name we did not link is left alone.
+bindir=${CLAUDE_LOADOUT_BIN_DIR:-$HOME/.local/bin}
+link_bins() {    # $1 = install | uninstall
+    for b in claude-mem claude-state; do
+        l=$bindir/$b
+        ours=
+        [ -L "$l" ] && case $(readlink "$l") in */minimal/loadouts/claude/bin/"$b") ours=1 ;; esac
+        if [ "$1" = uninstall ]; then
+            [ -z "$ours" ] || { rm -f "$l"; echo "removed $l"; }
+        elif [ -e "$l" ] && [ -z "$ours" ]; then
+            echo "$l exists and is not ours; not linked" >&2
+        else
+            mkdir -p "$bindir"
+            ln -sfn "$dest/bin/$b" "$l"
+        fi
+    done
+    [ "$1" = uninstall ] && return 0
+    echo "linked claude-mem and claude-state into $bindir"
+    case :$PATH: in *:"$bindir":*) ;; *) echo "note: $bindir is not on PATH" ;; esac
+}
+
 if [ -n "$uninstall" ]; then
+    link_bins uninstall
     merge_hooks uninstall
     echo "loadout left in place at $dest"
     exit 0
@@ -117,21 +141,18 @@ if [ -n "$init" ]; then
     "$dest/bin/claude-state" init
 fi
 
-# Host commits to main must be signed: the trust boundary rests on it. The
-# same checks claude-mem's signing_ready makes, against the state clone.
-repo=${CLAUDE_LOADOUT_MEMORY_REPO:-${CLAUDE_STATE_DIR:-$HOME/.local/share/claude-state}}
-signers=${XDG_CONFIG_HOME:-$HOME/.config}/claude-loadout/allowed_signers
+# Host commits to main must be signed: the trust boundary rests on it. Checked
+# against the state clone, never a CLAUDE_LOADOUT_MEMORY_REPO left exported
+# from the old layout.
+repo=${CLAUDE_STATE_DIR:-$HOME/.local/share/claude-state}
 if [ -d "$repo/.git" ]; then
-    if [ "$(git -C "$repo" config gpg.format || true)" = ssh ] \
-        && [ -n "$(git -C "$repo" config user.signingkey || true)" ] \
-        && [ "$(git -C "$repo" config --bool commit.gpgsign || true)" = true ] \
-        && [ "$(git -C "$repo" config gpg.ssh.allowedSignersFile || true)" = "$signers" ] \
-        && [ -s "$signers" ]; then
+    if CLAUDE_LOADOUT_MEMORY_REPO=$repo "$dest/bin/claude-mem" setup --check; then
         echo "commits in $repo are signed"
     else
-        "$dest/bin/claude-mem" setup
+        CLAUDE_LOADOUT_MEMORY_REPO=$repo "$dest/bin/claude-mem" setup
     fi
 fi
 
+link_bins install
 merge_hooks install
 command -v min >/dev/null && min loadout list 2>&1 | grep -E '^ *claude ' || true

@@ -118,7 +118,10 @@ normalize() {
 }
 
 key_of() {
-    git -C "$1" rev-parse --git-dir >/dev/null 2>&1 || return 1
+    # Only a repo's root has its key: a project nested inside another repo
+    # (a dotfiles-managed home, say) is not that repo.
+    kt=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null) || return 1
+    [ "$(cd "$1" && pwd -P)" = "$(cd "$kt" && pwd -P)" ] || return 1
     u=$(git -C "$1" config --get remote.origin.url) || return 1
     k=$(normalize "$u")
     valid_key "$k" || return 1
@@ -224,15 +227,13 @@ install_if_extends() {
 repo_ready() {
     git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || { note "no state clone at $REPO (claude-state init)"; return 1; }
 }
-# Host commits go through the repo's signing config; unsigned ones would be
-# refused by every other host's sync.
-signing_ready() { [ "$(g config --bool commit.gpgsign)" = true ] && [ -n "$(g config user.signingkey)" ]; }
 
 # publish KEY: copy the transcripts on stdin into repos/KEY/transcripts (new,
 # or extending the stored copy), then trim the key to the caps.
 publish() {
     dest=$REPO/repos/$1/transcripts
-    scratch
+    # TMPD comes from the caller: this runs at the end of a pipeline, in a
+    # subshell, so a scratch dir made here would never be cleaned up.
     while IFS= read -r f; do
         b=${f##*/}; u=${b%.jsonl}
         cp "$f" "$TMPD/t" && install_if_extends "$TMPD/t" "$dest/$b"
@@ -297,10 +298,9 @@ cmd_init() {
         mkdir -p "$(dirname "$REPO")"
         gh repo clone "$name" "$REPO" -- -q || die "could not clone $name to $REPO"
     fi
-    # Seeding commits, and they must be signed.
     # Before seeding, which commits. setup is idempotent and reports its own
     # failure (no key, no user.email; git falls back to the global identity).
-    signing_ready || mem setup || exit 1
+    mem setup --check || mem setup || exit 1
     if ! g rev-parse -q --verify HEAD >/dev/null; then
         # A new, empty remote: start main with an empty index.
         g symbolic-ref HEAD refs/heads/main
@@ -339,7 +339,7 @@ cmd_seed() {
     host_only seed
     command -v jq >/dev/null || die "jq is required"
     repo_ready || exit 1
-    signing_ready || die "memory commits are not signed yet; run: claude-mem setup"
+    mem setup --check || die "memory commits are not signed yet; run: claude-mem setup"
     lock 60 || die "another claude-state run holds $STATE/lock"
     scratch
     ensure_index
@@ -393,7 +393,9 @@ cmd_seed() {
     awk -F '\t' '$2 == "-"' "$TMPD/sorted" | while IFS="$(printf '\t')" read -r _ _ s p; do
         index_jq --arg s "$s" --arg p "$p" '.local[$s] = ((.local[$s] // {}) + {path: $p})'
     done
-    commit_paths "claude-state: seed from $(hostname -s 2>/dev/null || echo host)" index.json repos \
+    # Transcripts and the index only: memory reaches main through link --commit
+    # (or review), never as a side effect of seeding.
+    commit_paths "claude-state: seed from $(hostname -s 2>/dev/null || echo host)" index.json ':(glob)repos/**/transcripts/**' \
         || die "seed commit failed"
     mem sync || note "sync failed; commits are local in $REPO (claude-mem sync)"
     echo "seeded $(grep -vc "	-	" "$TMPD/found" | tr -d ' ') repo clone(s), $(grep -c "	-	" "$TMPD/found" | tr -d ' ') local project(s)"
@@ -401,46 +403,85 @@ cmd_seed() {
 
 # --- host: pull ------------------------------------------------------------------
 
-# Import the transcripts a session branch changed, for every key the index
-# knows, into that key's primary slug with /workbench rewritten to its path.
+# The key of the project a live session runs, from min's session list. A
+# destroyed session is no longer listed.
+session_key() {
+    command -v min >/dev/null 2>&1 || return 1
+    p=$(min session list --json 2>/dev/null | jq -r --arg n "$1" '
+        [.sessions[]? | select((.name // "" | gsub("[^A-Za-z0-9_-]"; "_")) == $n)][0].project_path // empty') || return 1
+    [ -n "$p" ] || return 1
+    key_of "$p" || echo -
+}
+
+# Import the transcripts a session branch changed for the session's own key
+# into the first clone of that key present on this host, /workbench rewritten
+# to its path. Returns 1 when the import is incomplete (no clone of the key
+# here, or over the PULL_MB budget): the branch must then stay for a later
+# pull.
 import_branch() {
     ref=$1 name=$2
     base=$(g merge-base HEAD "$ref" 2>/dev/null) || return 0
-    budget=$((PULL_MB * MB)); taken=0; n=0
     scratch
-    jq -r '.repos | keys[]' "$(index_file)" 2>/dev/null > "$TMPD/keys" || return 0
-    while IFS= read -r k; do
-        valid_key "$k" || continue
-        slug=$(jq -r --arg k "$k" '.repos[$k].slugs[0] // empty' "$(index_file)")
-        path=$(jq -r --arg k "$k" '.repos[$k].paths[0] // empty' "$(index_file)")
-        case $slug in ''|*[!A-Za-z0-9-]*) continue ;; esac
-        [ -n "$path" ] || continue
-        pre=repos/$k/transcripts/
-        g diff --name-only --no-renames --diff-filter=AM "$base" "$ref" -- "$pre" > "$TMPD/changed"
-        while IFS= read -r f; do
-            r=${f#"$pre"}
-            case $r in
-                */*) valid_uuid "${r%%/*}" && valid_rel "${r#*/}" || { note "$name: ignored $f"; continue; } ;;
-                *.jsonl) valid_uuid "${r%.jsonl}" || { note "$name: ignored $f"; continue; } ;;
-                *) note "$name: ignored $f"; continue ;;
-            esac
-            [ "$(g ls-tree "$ref" -- "$f" | cut -d' ' -f1)" = 100644 ] \
-                || { note "$name: ignored $f: not a regular file"; continue; }
-            s=$(g cat-file -s "$ref:$f") || continue
-            [ "$s" -le $((FILE_MB * MB)) ] || { note "$name: skipped $f: over $FILE_MB MB"; continue; }
-            [ $((taken + s)) -le "$budget" ] \
-                || { note "$name: over $PULL_MB MB of transcripts; the rest not imported (raise CLAUDE_LOADOUT_PULL_MB)"; break; }
-            taken=$((taken + s))
-            g cat-file blob "$ref:$f" > "$TMPD/in" || continue
-            case $r in
-                *.jsonl) rewrite "$path" "$WORKBENCH" < "$TMPD/in" > "$TMPD/out" ;;
-                *) mv "$TMPD/in" "$TMPD/out" ;;
-            esac
-            install_if_extends "$TMPD/out" "$PROJECTS/$slug/$r" || continue
-            case $r in *.jsonl) n=$((n + 1)) ;; esac
-        done < "$TMPD/changed"
-    done < "$TMPD/keys"
-    [ "$n" -eq 0 ] || echo "claude-state: imported $n transcript(s) from session $name"
+    # One diff per branch: ":m1 m2 sha1 sha2 X<TAB>path" -> "mode<TAB>sha<TAB>path".
+    g diff --raw --no-abbrev --no-renames --diff-filter=AM "$base" "$ref" -- repos/ \
+        | awk -F '\t' '{ split($1, a, " "); print a[2] "\t" a[4] "\t" $2 }' > "$TMPD/changed"
+    # Trust: only the session's own project. A session min still lists names
+    # it; a destroyed one counts only if the branch touches a single key.
+    if k=$(session_key "$name"); then
+        # Its project path here has no origin (moved, or the remote was
+        # removed): which key is its own cannot be told, so wait.
+        [ "$k" != - ] || { note "$name: no origin for the session's project on this host"; return 1; }
+    else
+        cut -f3 "$TMPD/changed" | awk '{
+            p = substr($0, 7); i = index(p, "/memory/"); j = index(p, "/transcripts/")
+            if (i && (!j || i < j)) print substr(p, 1, i - 1); else if (j) print substr(p, 1, j - 1)
+        }' | sort -u > "$TMPD/keys"
+        if [ "$(wc -l < "$TMPD/keys" | tr -d ' ')" -ne 1 ]; then
+            [ ! -s "$TMPD/keys" ] || note "$name: session not listed and the branch touches several keys; no transcripts imported"
+            return 0
+        fi
+        k=$(cat "$TMPD/keys")
+    fi
+    valid_key "$k" || { note "$name: ignored key '$k'"; return 0; }
+    pre=repos/$k/transcripts/
+    awk -F '\t' -v p="$pre" 'index($3, p) == 1' "$TMPD/changed" > "$TMPD/mine"
+    [ -s "$TMPD/mine" ] || return 0
+    # Where to: the first clone of the key that exists on this host.
+    jq -r --arg k "$k" '.repos[$k] // {} | [.slugs // [], .paths // []] | transpose[] | @tsv' \
+        "$(index_file)" 2>/dev/null > "$TMPD/clones"
+    slug=; path=
+    while IFS="$(printf '\t')" read -r s p; do
+        case $s in ''|*[!A-Za-z0-9-]*) continue ;; esac
+        [ -n "$p" ] && [ -d "$p" ] && { slug=$s; path=$p; break; }
+    done < "$TMPD/clones"
+    [ -n "$slug" ] || { note "$name: no clone of $k on this host; session/$name left for later"; return 1; }
+    cut -f2 "$TMPD/mine" | g cat-file --batch-check='%(objectsize)' | paste - "$TMPD/mine" > "$TMPD/sized"
+    budget=$((PULL_MB * MB)); taken=0; n=0; rc=0
+    while IFS="$(printf '\t')" read -r s mode sha f; do
+        r=${f#"$pre"}
+        case $r in
+            */*) valid_uuid "${r%%/*}" && valid_rel "${r#*/}" || { note "$name: ignored $f"; continue; } ;;
+            *.jsonl) valid_uuid "${r%.jsonl}" || { note "$name: ignored $f"; continue; } ;;
+            *) note "$name: ignored $f"; continue ;;
+        esac
+        [ "$mode" = 100644 ] || { note "$name: ignored $f: not a regular file"; continue; }
+        case $s in ''|*[!0-9]*) continue ;; esac
+        [ "$s" -le $((FILE_MB * MB)) ] || { note "$name: skipped $f: over $FILE_MB MB"; continue; }
+        if [ $((taken + s)) -gt "$budget" ]; then
+            note "$name: over $PULL_MB MB of transcripts; session/$name left for later (raise CLAUDE_LOADOUT_PULL_MB)"
+            rc=1; break
+        fi
+        taken=$((taken + s))
+        g cat-file blob "$sha" > "$TMPD/in" || continue
+        case $r in
+            *.jsonl) rewrite "$path" "$WORKBENCH" < "$TMPD/in" > "$TMPD/out" ;;
+            *) mv "$TMPD/in" "$TMPD/out" ;;
+        esac
+        install_if_extends "$TMPD/out" "$PROJECTS/$slug/$r" || continue
+        case $r in *.jsonl) n=$((n + 1)) ;; esac
+    done < "$TMPD/sized"
+    [ "$n" -eq 0 ] || echo "claude-state: imported $n transcript(s) from session $name into $slug"
+    return "$rc"
 }
 
 cmd_pull() {
@@ -466,9 +507,13 @@ cmd_pull() {
     for ref in $(g for-each-ref --format='%(refname)' refs/remotes/origin/session/); do
         name=${ref#refs/remotes/origin/session/}
         case $name in ''|*[!A-Za-z0-9_-]*) note "ignored branch session/$name"; continue ;; esac
-        # Transcripts first: recover deletes the branch.
-        import_branch "$ref" "$name"
-        mem recover --session "$name" || note "recover of session/$name failed"
+        # Transcripts first: recover deletes the branch, so it runs only once
+        # everything the branch carries for this host is in.
+        if import_branch "$ref" "$name"; then
+            mem recover --session "$name" || note "recover of session/$name failed"
+        else
+            note "session/$name: import incomplete; memories not recovered yet, branch kept"
+        fi
     done
     exit 0
 }
@@ -502,9 +547,10 @@ cmd_push() {
     repo_ready || exit 1
     # Transcripts are stored only for projects with an origin.
     k=$(key_of "$path") || { note "$path has no origin; transcripts are not published"; return 0; }
-    signing_ready || die "memory commits are not signed yet; run: claude-mem setup"
+    mem setup --check || die "memory commits are not signed yet; run: claude-mem setup"
     lock 120 || die "another claude-state run holds $STATE/lock"
     mem sync || note "sync did not complete; publishing on top of the local clone"
+    scratch     # here, not in publish: that runs in a pipeline subshell
     transcripts_in "$PROJECTS/$slug" | by_newest | cap_select | publish "$k"
     index_primary "$k" "$slug" "$path" || die "could not update index.json"
     commit_paths "claude-state: transcripts of $k" index.json "repos/$k/transcripts" || die "commit failed"
@@ -513,14 +559,19 @@ cmd_push() {
 
 # --- session -----------------------------------------------------------------------
 
-# Transcripts activate/attach installed, "<rel> <size>" per line, so teardown
-# sends only what the session wrote or extended.
-MANIFEST=$REPO/.git/claude-state-imported
-manifest_set() {
-    { awk -v r="$1" '$1 != r' "$MANIFEST" 2>/dev/null
-      printf '%s %s\n' "$1" "$(fsize "$WB/$1")"; } > "$MANIFEST.tmp" && mv "$MANIFEST.tmp" "$MANIFEST"
+# Manifests, "<path> TAB <blob hash>" per line, so a push sends only what is
+# new to the other side:
+#   imported: transcripts activate/attach installed (path relative to -workbench)
+#   pushed:   memory and transcript paths a session push sent (repo paths)
+IMPORTED=$REPO/.git/claude-state-imported
+PUSHED=$REPO/.git/claude-state-pushed
+mf_set() {
+    { awk -F '\t' -v p="$2" '$1 != p' "$1" 2>/dev/null; printf '%s\t%s\n' "$2" "$3"; } > "$1.tmp" \
+        && mv "$1.tmp" "$1"
 }
-manifest_has() { grep -qxF -- "$1 $(fsize "$WB/$1")" "$MANIFEST" 2>/dev/null; }
+mf_has() { grep -qxF -- "$(printf '%s\t%s' "$2" "$3")" "$1" 2>/dev/null; }
+
+session_name() { printf '%s' "${MINIMAL_SESSION_NAME:-}" | sed 's/[^A-Za-z0-9_-]/_/g'; }
 
 # Copy the key's transcripts from the clone into -workbench, cwd rewritten
 # from every host path of the key to /workbench; only new files or files
@@ -537,13 +588,16 @@ session_import() {
     for f in $(transcripts_in "$src" | tr '\n' ' '); do
         b=${f##*/}; u=${b%.jsonl}
         rewrite "$WORKBENCH" "$@" < "$f" > "$TMPD/t"
-        if install_if_extends "$TMPD/t" "$WB/$b"; then manifest_set "$b"; n=$((n + 1)); fi
+        if install_if_extends "$TMPD/t" "$WB/$b"; then
+            mf_set "$IMPORTED" "$b" "$(g hash-object -- "$WB/$b")"; n=$((n + 1))
+        fi
         for r in $(sidecar "$src/$u"); do
             case $r in
                 *.jsonl) rewrite "$WORKBENCH" "$@" < "$src/$u/$r" > "$TMPD/t" ;;
                 *) cp "$src/$u/$r" "$TMPD/t" ;;
             esac
-            install_if_extends "$TMPD/t" "$WB/$u/$r" && manifest_set "$u/$r"
+            install_if_extends "$TMPD/t" "$WB/$u/$r" \
+                && mf_set "$IMPORTED" "$u/$r" "$(g hash-object -- "$WB/$u/$r")"
         done
     done
     echo "claude: transcripts: $n imported for $k"
@@ -588,8 +642,36 @@ cmd_session_attach() {
     session_only session-attach
     [ -d "$REPO/.git" ] || return 0
     k=$(key_of "$WORKBENCH") || return 0
+    name=$(session_name)
     if g fetch -q origin; then
         up=$(g rev-parse -q --verify '@{u}') || up=origin/main
+        # The host consumed session/<name> (recover deletes it): its keep and
+        # discard decisions win for what was sent. Back to main's commits,
+        # and every sent memory not edited since back to main's version (or
+        # gone, if main lacks it); later edits stay pending.
+        if [ -n "$name" ] && [ -s "$PUSHED" ] \
+            && heads=$(g ls-remote --heads origin "refs/heads/session/$name") && [ -z "$heads" ]; then
+            # Mixed, so memory edits survive; then everything else in the
+            # checkout (index.json, transcripts) is put back to main.
+            g reset -q "$up"
+            g checkout -q -- index.json 2>/dev/null
+            g checkout -q -- "repos/$k/transcripts" 2>/dev/null
+            g clean -fdq -- "repos/$k/transcripts" 2>/dev/null
+            scratch
+            awk -F '\t' -v p="repos/$k/memory/" 'index($1, p) == 1' "$PUSHED" > "$TMPD/sent"
+            while IFS="$(printf '\t')" read -r p h; do
+                [ "$(g hash-object -- "$REPO/$p" 2>/dev/null)" = "$h" ] || continue
+                if g cat-file -e "$up:$p" 2>/dev/null; then
+                    g checkout -q "$up" -- "$p"
+                else
+                    rm -f "${REPO:?}/${p:?}"
+                fi
+            done < "$TMPD/sent"
+            # Transcript entries stay, so those are not sent again.
+            awk -F '\t' '$1 !~ /^(repos\/.*|local\/[^\/]*)\/memory\//' "$PUSHED" > "$PUSHED.tmp" \
+                && mv "$PUSHED.tmp" "$PUSHED"
+            echo "claude: the host took session/$name; sent memories now follow its review"
+        fi
         if ! g rebase -q --autostash "$up" >/dev/null 2>&1; then
             g rebase --abort >/dev/null 2>&1
             echo "claude: could not rebase the state clone onto $up; memories stay as they were"
@@ -600,11 +682,15 @@ cmd_session_attach() {
     session_import "$k"
 }
 
-cmd_session_teardown() {
-    session_only session-teardown
+# Send the session's memories and new transcripts to session/<name>, stacked
+# on the branch's tip while it exists (else on HEAD), fast-forward only: the
+# host may be reading the branch, and a push only ever adds to it. Run by the
+# teardown hooks and by claude-mem keep/stash in the session.
+cmd_session_push() {
+    session_only session-push
     [ -d "$REPO/.git" ] || return 0
     k=$(key_of "$WORKBENCH") || return 0
-    name=$(printf '%s' "${MINIMAL_SESSION_NAME:-}" | sed 's/[^A-Za-z0-9_-]/_/g')
+    name=$(session_name)
     [ -n "$name" ] || { echo "claude: MINIMAL_SESSION_NAME unset; nothing sent"; return 0; }
     # commit-tree needs an identity; the session may not have one.
     g config user.email >/dev/null 2>&1 || {
@@ -612,53 +698,88 @@ cmd_session_teardown() {
         export GIT_COMMITTER_NAME=claude-session GIT_COMMITTER_EMAIL=session@localhost
     }
     scratch
-    idx=$TMPD/index
+    b=session/$name
     mrel=repos/$k/memory
-    GIT_INDEX_FILE=$idx g read-tree HEAD || return 0
-    pending=
-    if [ -n "$(g status --porcelain=v1 -uall -- "$mrel" 2>/dev/null)" ]; then
-        pending=1
-        GIT_INDEX_FILE=$idx g add -A -- "$mrel" || return 0
-    fi
-    # Transcripts the session wrote or extended since activate/attach,
-    # newest first, plain files under the caps; cwd stays /workbench.
     trel=repos/$k/transcripts
+    pending=
+    [ -z "$(g status --porcelain=v1 -uall -- "$mrel" 2>/dev/null)" ] || pending=1
+    # Transcripts the session wrote or extended and has not sent, newest
+    # first, plain files under the caps; cwd stays /workbench.
+    : > "$TMPD/send"
     budget=$((PULL_MB * MB)); total=0; n=0
     for f in $(transcripts_in "$WB" | by_newest | tr '\n' ' '); do
-        b=${f##*/}; u=${b%.jsonl}
-        set -- "$b"
+        t=${f##*/}; u=${t%.jsonl}
+        set -- "$t"
         for r in $(sidecar "$WB/$u"); do set -- "$@" "$u/$r"; done
         for r; do
-            manifest_has "$r" && continue
+            h=$(g hash-object -- "$WB/$r") || continue
+            mf_has "$IMPORTED" "$r" "$h" && continue
+            mf_has "$PUSHED" "$trel/$r" "$h" && continue
             s=$(fsize "$WB/$r")
             [ "$s" -le $((FILE_MB * MB)) ] || continue
             [ $((total + s)) -le "$budget" ] || break 2
-            sha=$(g hash-object -w -- "$WB/$r") || continue
-            GIT_INDEX_FILE=$idx g update-index --add --cacheinfo "100644,$sha,$trel/$r" || continue
+            g hash-object -w -- "$WB/$r" >/dev/null || continue
+            printf '%s\t%s\n' "$r" "$h" >> "$TMPD/send"
             total=$((total + s))
             case $r in *.jsonl) n=$((n + 1)) ;; esac
         done
     done
     up=$(g rev-parse -q --verify '@{u}') || up=
-    if [ -z "$pending" ] && [ "$n" -eq 0 ] && [ "$(g rev-parse HEAD)" = "$up" ] \
-        && [ "$(GIT_INDEX_FILE=$idx g write-tree)" = "$(g rev-parse 'HEAD^{tree}')" ]; then
-        echo "claude: nothing to send"
-        return 0
-    fi
-    tree=$(GIT_INDEX_FILE=$idx g write-tree) || return 0
-    # The claude-mem convention: a tip carrying pending memories says so,
-    # which is how recover tells them from kept ones.
-    if [ -n "$pending" ]; then
-        msg="claude-mem stash: unreviewed memories from $name"
-    else
-        msg="claude-state: transcripts from $name"
-    fi
-    commit=$(g commit-tree "$tree" -p HEAD -m "$msg") || return 0
-    if g push -q -f origin "$commit:refs/heads/session/$name" >/dev/null 2>&1; then
-        echo "claude: sent ${pending:+pending memories and }$n transcript(s) to session/$name"
-    else
-        echo "claude: push to session/$name failed; memories and transcripts remain only in this session"
-    fi
+    idx=$TMPD/index
+    try=0
+    while :; do
+        try=$((try + 1))
+        head=$(g rev-parse HEAD) || return 1
+        parent=$head
+        if g fetch -q origin "+refs/heads/$b:refs/remotes/origin/$b" 2>/dev/null; then
+            tip=$(g rev-parse -q --verify "refs/remotes/origin/$b") \
+                && g merge-base HEAD "$tip" >/dev/null 2>&1 && parent=$tip
+        else
+            g update-ref -d "refs/remotes/origin/$b" 2>/dev/null
+        fi
+        # Keep commits made since the last push must be in the branch's
+        # history (recover reads them to mark memories kept), so HEAD joins
+        # the stacked tip as a second parent when the tip lacks it.
+        merge=
+        [ "$parent" = "$head" ] || g merge-base --is-ancestor HEAD "$parent" || merge=$head
+        GIT_INDEX_FILE=$idx g read-tree "$parent" || return 1
+        # All of the memory dir as it is now. add fails only when the
+        # pathspec matches nothing, and then there is nothing to add.
+        GIT_INDEX_FILE=$idx g add -A -- "$mrel" 2>/dev/null
+        while IFS="$(printf '\t')" read -r r h; do
+            GIT_INDEX_FILE=$idx g update-index --add --cacheinfo "100644,$h,$trel/$r" || return 1
+        done < "$TMPD/send"
+        tree=$(GIT_INDEX_FILE=$idx g write-tree) || return 1
+        # Nothing new: the tip already has it all, or there is no branch and
+        # HEAD is main (no kept commits to send).
+        if [ "$tree" = "$(g rev-parse "$parent^{tree}")" ] && [ -z "$merge" ] \
+            && { [ "$parent" != "$head" ] || [ "$head" = "$up" ]; }; then
+            return 0
+        fi
+        # The claude-mem convention: a tip carrying pending memories says so,
+        # which is how recover tells them from kept ones.
+        if [ -n "$pending" ]; then
+            msg="claude-mem stash: unreviewed memories from $name"
+        else
+            msg="claude-state: from $name"
+        fi
+        commit=$(g commit-tree "$tree" -p "$parent" ${merge:+-p "$merge"} -m "$msg") || return 1
+        g push -q origin "$commit:refs/heads/$b" >/dev/null 2>&1 && break
+        # Rejected: the tip moved under us. Refetch and try once more.
+        if [ "$try" -ge 2 ]; then
+            echo "claude: push to $b failed; memories and transcripts remain only in this session"
+            return 1
+        fi
+    done
+    # Record what was sent: memories that differ from main, and transcripts.
+    g ls-tree -r "$commit" -- "$mrel/" | awk -F '\t' '{ split($1, a, " "); print $2 "\t" a[3] }' > "$TMPD/m.sent"
+    : > "$TMPD/m.main"
+    [ -z "$up" ] || g ls-tree -r "$up" -- "$mrel/" | awk -F '\t' '{ split($1, a, " "); print $2 "\t" a[3] }' > "$TMPD/m.main"
+    grep -vxF -f "$TMPD/m.main" "$TMPD/m.sent" | while IFS="$(printf '\t')" read -r p h; do
+        mf_set "$PUSHED" "$p" "$h"
+    done
+    while IFS="$(printf '\t')" read -r r h; do mf_set "$PUSHED" "$trel/$r" "$h"; done < "$TMPD/send"
+    echo "claude: sent memories${pending:+ (some unreviewed)} and $n transcript(s) to $b"
 }
 
 usage() {
@@ -671,7 +792,8 @@ usage: claude-state <command>
   push [--hook]        host: publish this project's recent transcripts
   session-activate     session: clone, link memory, import transcripts
   session-attach       session: rebase onto the remote, import new transcripts
-  session-teardown     session: send memories and transcripts to session/<name>
+  session-push         session: send memories and new transcripts to session/<name>
+  session-teardown     same as session-push
 repo: $REPO
 EOF
 }
@@ -685,7 +807,7 @@ case $cmd in
     push)             cmd_push "$@" ;;
     session-activate) cmd_session_activate ;;
     session-attach)   cmd_session_attach ;;
-    session-teardown) cmd_session_teardown ;;
+    session-push|session-teardown) cmd_session_push ;;
     -h|--help|help)   usage ;;
     *) usage >&2; exit 2 ;;
 esac

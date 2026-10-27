@@ -28,9 +28,10 @@ git clone https://github.com/norrietaylor/claude-loadout ~/src/claude-loadout
 1. Copies `loadout/` to `~/.config/minimal/loadouts/claude`. Re-run it after every edit.
 2. Runs `claude-state init`, unless you pass `--no-init`. That creates the private repo `$CLAUDE_STATE_REPO` if it is missing, clones it to `$CLAUDE_STATE_DIR`, writes the remote URL to `~/.config/claude-loadout/remote`, and seeds it from `~/.claude/projects`.
 3. Runs `claude-mem setup` if the clone's commits aren't signed yet. It uses an SSH key, `~/.ssh/id_ed25519.pub` by default. If it fails, run `claude-mem setup <key.pub>` and then re-run `install.sh`.
-4. Adds the two host hooks to `~/.claude/settings.json`, or to `$CLAUDE_CONFIG_DIR/settings.json` if that is set. It writes a timestamped backup next to the file first. If the file is a symlink, the real file is edited in place. Re-running leaves one entry per event.
+4. Links `claude-mem` and `claude-state` into `~/.local/bin` (or `$CLAUDE_LOADOUT_BIN_DIR`), so you can run them on the host. A file of that name it didn't create is left alone.
+5. Adds the two host hooks to `~/.claude/settings.json`, or to `$CLAUDE_CONFIG_DIR/settings.json` if that is set. It writes a timestamped backup next to the file first. If the file is a symlink, the real file is edited in place. Re-running leaves one entry per event. Each hook checks that the script exists first, so a settings file shared with a machine without the loadout does nothing there.
 
-`install.sh --uninstall` removes only those hook entries. The loadout, the clone and the remote stay.
+`install.sh --uninstall` removes only those links and hook entries. The loadout, the clone and the remote stay.
 
 Then:
 

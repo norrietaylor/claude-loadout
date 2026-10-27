@@ -32,6 +32,7 @@ else
 fi
 INBOX=${XDG_STATE_HOME:-$HOME/.local/state}/claude-loadout/inbox
 SIGNERS=${XDG_CONFIG_HOME:-$HOME/.config}/claude-loadout/allowed_signers
+PROJECTS=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects
 
 die() { echo "claude-mem: $*" >&2; exit 1; }
 note() { echo "claude-mem: $*" >&2; }
@@ -45,15 +46,23 @@ valid_key() {
     return 0
 }
 
+# The claude-state CLI installed beside this script, else on PATH.
+state_cli() {
+    c=$(dirname "$0")/claude-state
+    [ -x "$c" ] || c=$(command -v claude-state 2>/dev/null) || return 1
+    printf "%s\n" "$c"
+}
+
 # Normalized origin of the git checkout at $1, as `claude-state key` prints
 # it. The inline copy is the fallback for when claude-state is not installed.
 key_of() {
-    cs=$(dirname "$0")/claude-state
-    [ -x "$cs" ] || cs=$(command -v claude-state 2>/dev/null) || cs=
-    if [ -n "$cs" ]; then
+    if cs=$(state_cli); then
         k=$("$cs" key "$1" 2>/dev/null) || return 1
     else
-        git -C "$1" rev-parse --git-dir >/dev/null 2>&1 || return 1
+        # Only a repo's root has its key: a project nested inside another repo
+        # (a dotfiles-managed home, say) is not that repo.
+        kt=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null) || return 1
+        [ "$(cd "$1" && pwd -P)" = "$(cd "$kt" && pwd -P)" ] || return 1
         # The raw URL: `git remote get-url` applies insteadOf rewrites.
         u=$(git -C "$1" config --get remote.origin.url) || return 1
         case $u in
@@ -77,7 +86,6 @@ else
 fi
 SLUG=$(slug_for "$top")
 KEY=$(key_of "$top") || KEY=
-SESSION=$(printf '%s' "${MINIMAL_SESSION_NAME:-$(hostname -s 2>/dev/null || echo host)}" | sed 's/[^A-Za-z0-9_-]/_/g')
 
 if [ -n "$KEY" ]; then REL=repos/$KEY/memory; else REL=local/$SLUG/memory; fi
 DIR=$REPO/$REL                  # project memory dir
@@ -218,7 +226,7 @@ cmd_keep() {
         || die "commit failed"
     if [ -n "$IN_SESSION" ]; then
         echo "Kept: $names (sent to the host, which publishes it after its own review)"
-        cmd_stash
+        cmd_stash || :
     else
         echo "Kept: $names"
         [ -n "$no_push" ] || cmd_sync
@@ -313,32 +321,13 @@ cmd_review() {
     return 0
 }
 
-# Send kept and pending memories to session/<name> without touching the
-# working tree: what `keep` does in a session. Session teardown
-# (claude-state) force-pushes the same branch with transcripts added.
+# Session: send kept and pending memories (and transcripts) to
+# session/<name>. claude-state owns that branch and stacks each push on the
+# last, so this only hands over to it.
 cmd_stash() {
     need_repo
-    b=session/$SESSION
-    up=$(g rev-parse -q --verify '@{u}' 2>/dev/null) || up=
-    if [ -z "$(pending)" ] && [ "$(g rev-parse HEAD)" = "$up" ]; then
-        # Nothing to send. An older branch is left alone: it may carry
-        # transcripts, and recover only files its memories for review.
-        return 0
-    fi
-    commit=HEAD
-    if [ -n "$(pending)" ]; then
-        idx=$(mktemp)
-        trap 'rm -f "$idx"' EXIT
-        GIT_INDEX_FILE=$idx g read-tree HEAD || return 1
-        GIT_INDEX_FILE=$idx g add -A -- "$REL" || return 1
-        tree=$(GIT_INDEX_FILE=$idx g write-tree) || return 1
-        commit=$(g commit-tree "$tree" -p HEAD -m "claude-mem stash: unreviewed memories from $SESSION") || return 1
-    fi
-    if g push -q -f origin "$commit:refs/heads/$b" >/dev/null 2>&1; then
-        echo "claude-mem: sent memories to $b for review on the host"
-    else
-        note "push to $b failed; memories remain only in $DIR"
-    fi
+    cs=$(state_cli) || { note "claude-state not found; memories stay committed in $REPO"; return 1; }
+    "$cs" session-push
 }
 
 # Host: copy one file a session changed into the inbox. Only flat *.md files
@@ -347,7 +336,7 @@ cmd_stash() {
 # beside the memory it points at. Paths outside a memory dir (transcripts,
 # which claude-state imports itself) are skipped without comment.
 inbox_one() {
-    ref=$1 base=$2 kept=$3 f=$4
+    ref=$1 base=$2 f=$3
     case $f in
         repos/*/memory/*)
             rel=${f#repos/}; key=${rel%/memory/*}; id=repos/$key
@@ -379,7 +368,10 @@ inbox_one() {
     # Already identical to the host's copy (sent again by a later stash).
     if cmp -s "$d/$name.tmp" "$REPO/$f"; then rm -f "$d/$name.tmp"; return 0; fi
     mv "$d/$name.tmp" "$d/$name"
-    g diff --quiet "$base" "$kept" -- "$f" || : > "$d/$name.kept"
+    # Kept in the session: the last memory(...) commit on the branch to touch
+    # the file left it as it is at the tip (later commits only add pending).
+    lc=$(g log --format="%H %s" "$base..$ref" -- "$f" | awk '$2 ~ /^memory\(/ { print $1; exit }')
+    if [ -n "$lc" ] && g diff --quiet "$lc" "$ref" -- "$f"; then : > "$d/$name.kept"; fi
 }
 
 cmd_recover() {
@@ -399,10 +391,8 @@ cmd_recover() {
         b=${ref#refs/remotes/origin/}
         base=$(g merge-base HEAD "$ref" 2>/dev/null) \
             || { note "$b shares no history with $REPO; left on the remote"; continue; }
-        kept=$ref
-        case $(g log -1 --format=%s "$ref") in "claude-mem stash:"*) kept=$ref^ ;; esac
         g diff --name-only --no-renames --diff-filter=AM "$base" "$ref" -- repos local \
-            | while IFS= read -r f; do inbox_one "$ref" "$base" "$kept" "$f"; done
+            | while IFS= read -r f; do inbox_one "$ref" "$base" "$f"; done
         g push -q origin ":refs/heads/$b" >/dev/null 2>&1
         g update-ref -d "$ref"
         echo "claude-mem: recovered $b into the review inbox (claude-mem review)"
@@ -450,6 +440,11 @@ EOF
 
 # Host: sign memory commits with an SSH key and trust it for sync.
 cmd_setup() {
+    # --check: is signing set up? Silent, changes nothing.
+    if [ "${1:-}" = --check ]; then
+        [ -n "$REPO" ] && git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 && signing_ready >/dev/null 2>&1
+        return
+    fi
     need_repo
     host_only setup
     key=${1:-${CLAUDE_LOADOUT_SIGNING_KEY:-$HOME/.ssh/id_ed25519.pub}}
@@ -469,7 +464,7 @@ cmd_setup() {
 # Host: the project path behind a slug, from the "cwd" its newest transcript
 # records (a slug cannot be turned back into a path).
 slug_path() {
-    t=$(ls -t "$HOME/.claude/projects/$1"/*.jsonl 2>/dev/null | head -1)
+    t=$(ls -t "$PROJECTS/$1"/*.jsonl 2>/dev/null | head -1)
     [ -n "$t" ] || return 1
     p=$(grep -o '"cwd":"[^"]*"' "$t" | tail -1 | sed 's/^"cwd":"//; s/"$//')
     [ -n "$p" ] && printf '%s\n' "$p"
@@ -483,7 +478,7 @@ slug_path() {
 link_one() {
     s=$1 commit=$2 key=${3:-}
     case $s in ''|*[!A-Za-z0-9-]*) note "ignored slug '$s'"; return 0 ;; esac
-    host=$HOME/.claude/projects/$s/memory
+    host=$PROJECTS/$s/memory
     if [ -L "$host" ]; then
         return 0
     fi
@@ -528,7 +523,7 @@ cmd_link() {
     [ "${1:-}" = --commit ] && { commit=1; shift; }
     [ -z "$commit" ] || signing_ready || die "memory commits are not signed yet; run: claude-mem setup"
     if [ "${1:-}" = --all ]; then
-        for d in "$HOME"/.claude/projects/*/memory; do
+        for d in "$PROJECTS"/*/memory; do
             [ -d "$d" ] || continue
             [ -n "$(ls -A "$d" 2>/dev/null)" ] || continue
             s=${d%/memory}; link_one "${s##*/}" "$commit"
@@ -546,10 +541,11 @@ usage: claude-mem <command>
   keep [--no-push] <file>...|--all   host: commit and publish; session: commit and send to the host
   discard <file>...|--all       drop pending memories (and their index lines)
   review [--if-pending]         interactive keep/discard
-  stash                         send kept and pending memories to session/<name>
+  stash                         session: claude-state session-push (memories to session/<name>)
   recover --session <name>|--all  host: copy memories on session/* branches into the review inbox, delete them
   sync                          host: take signed upstream commits, publish local ones
   setup [<key.pub>]             host: sign memory commits with an SSH key and trust it
+  setup --check                 host: exit 0 if memory commits are signed, else 1 (silent)
   link [--commit] [<slug> [<key>]|--all]
                                 host: symlink ~/.claude/projects/<slug>/memory to repos/<key>/memory
                                 (key from the slug's project origin) or local/<slug>/memory
