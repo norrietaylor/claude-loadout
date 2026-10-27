@@ -166,11 +166,16 @@ tsize() {
     echo "$s"
 }
 
+# A transcript with no assistant reply (a cancelled command, hook output
+# only) is not worth a slot or a /resume entry.
+has_turns() { grep -q '"type":"assistant"' "$1"; }
+
 # stdin: transcripts newest first; stdout: those within the caps.
 cap_select() {
     n=0; total=0
     while IFS= read -r f; do
         [ "$n" -lt "$MAX_FILES" ] || break
+        has_turns "$f" || continue
         [ "$(fsize "$f")" -le $((FILE_MB * MB)) ] || continue
         s=$(tsize "$f")
         [ $((total + s)) -le $((MAX_MB * MB)) ] || continue
@@ -219,7 +224,16 @@ install_if_extends() {
         fi
     fi
     mkdir -p "${2%/*}"
-    mv "$1" "$2"
+    mv "$1" "$2" || return 1
+    # /resume orders and ages by mtime: give the copy its last activity, not
+    # the time it was copied.
+    case $2 in *.jsonl)
+        t=$(stamp "$2" | cut -c1-19)
+        case $t in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9])
+            TZ=UTC touch -d "$t" "$2" 2>/dev/null ;;
+        esac ;;
+    esac
+    return 0
 }
 
 # --- host: publish -------------------------------------------------------------
@@ -708,6 +722,7 @@ cmd_session_push() {
     : > "$TMPD/send"
     budget=$((PULL_MB * MB)); total=0; n=0
     for f in $(transcripts_in "$WB" | by_newest | tr '\n' ' '); do
+        has_turns "$f" || continue
         t=${f##*/}; u=${t%.jsonl}
         set -- "$t"
         for r in $(sidecar "$WB/$u"); do set -- "$@" "$u/$r"; done
