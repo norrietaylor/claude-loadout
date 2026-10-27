@@ -1,14 +1,15 @@
-# Claude Code for min sessions: sandbox-correct settings, the project's recent
-# session history in (and new transcripts back out, via host.zsh), and
-# auto memory backed by a git repo you choose, with a keep/discard review.
+# Claude Code for min sessions: sandbox-correct settings, and the project's
+# memories and recent transcripts synced through a private git remote (the
+# "state remote", set up on the host by install.sh / `claude-state init`).
 #
 # Stack after `broker` (`--loadout broker --loadout claude`): broker supplies
-# Claude auth and the github.com rewrite the memory clone and push go through.
+# Claude auth and the github.com rewrite the state clone and push go through.
 #
-# Everything personal arrives as a host env var, set by host.zsh; with none
-# set, this falls back to stock ~/.claude and leaves memory sync off. Path
-# vars are relative to your host home.
-description = "Claude Code: sandbox settings, project history in/out, git-synced memory review"
+# The session finds its project by the git origin of /workbench. Lifecycle
+# hooks move state between the remote and the session; Claude Code hooks on
+# the host move it between the remote and the host. Path vars are relative
+# to your host home; with none set, this falls back to stock ~/.claude.
+description = "Claude Code: sandbox settings, memories and recent transcripts synced through a git remote"
 
 packages = ["claude", "git", "jq"]
 
@@ -28,20 +29,14 @@ patches = [
   { dest = ".local/bin/",             source = "$LOADOUT_ROOT/session-bin/*" },
   { dest = ".config/claude-loadout/shellrc.sh", source = "$LOADOUT_ROOT/shellrc.sh" },
 
-  # Recent transcripts for this project, staged by `claude-sessions stage`
-  # with their cwd rewritten to /workbench.
-  { dest = ".claude/projects/-workbench/", source = "~/.local/state/claude-loadout/stage/$CLAUDE_LOADOUT_SLUG/*.jsonl" },
-
-  # The host's memories for this project: only used when memory sync is off
-  # (no remote) or the clone fails, so the session still starts informed.
-  { dest = ".config/claude-loadout/seed-memory/", source = "~/.claude/projects/$CLAUDE_LOADOUT_SLUG/memory/*.md" },
+  # The state remote's URL (credentials stripped), written on the host by
+  # `claude-state init`. Missing on the host: dropped with a warning, and
+  # the session starts without synced state.
+  { dest = ".config/claude-loadout/remote", source = "~/.config/claude-loadout/remote" },
 ]
 
 [vars]
 CLAUDE_LOADOUT_IN_SESSION    = "1"
-CLAUDE_LOADOUT_SLUG          = { inherit = true, default = "none" }
-CLAUDE_LOADOUT_MEMORY_REMOTE = { inherit = true, default = "" }
-CLAUDE_LOADOUT_MEMORY_SUBDIR = { inherit = true, default = "memory" }
 CLAUDE_LOADOUT_CLAUDE_MD     = { inherit = true, default = ".claude/CLAUDE.md" }
 CLAUDE_LOADOUT_SETTINGS      = { inherit = true, default = ".config/minimal/loadouts/claude/settings.default.json" }
 CLAUDE_LOADOUT_OUTPUT_STYLES = { inherit = true, default = ".claude/output-styles" }
@@ -50,10 +45,14 @@ CLAUDE_LOADOUT_SKILLS        = { inherit = true, default = ".claude/skills" }
 CLAUDE_LOADOUT_TRUST_WORKBENCH = { inherit = true, default = "" }
 
 [[lifecycle_hooks]]
-description = "claude: memory repo + link, onboarding/trust, plugins"
+description = "claude: state clone + memory link + transcripts, onboarding/trust, plugins"
 on_activate = { type = "external", value = "./hooks/on-activate.sh", timeout = 240 }
 
 [[lifecycle_hooks]]
-description = "claude: send kept and unreviewed memories to pending/<session>/<slug>"
+description = "claude: take memories and transcripts the host published since activation"
+on_attach = { type = "external", value = "./hooks/on-attach.sh", timeout = 120 }
+
+[[lifecycle_hooks]]
+description = "claude: send session memories and transcripts to session/<name>"
 on_detach  = { type = "external", value = "./hooks/on-teardown.sh", timeout = 45 }
 on_destroy = { type = "external", value = "./hooks/on-teardown.sh", timeout = 45 }

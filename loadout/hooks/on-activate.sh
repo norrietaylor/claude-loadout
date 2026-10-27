@@ -5,42 +5,18 @@
 set -u
 
 say() { echo "claude: $*"; }
-SLUG=${CLAUDE_LOADOUT_SLUG:-none}
-SUB=${CLAUDE_LOADOUT_MEMORY_SUBDIR:-memory}
-REMOTE=${CLAUDE_LOADOUT_MEMORY_REMOTE:-}
-MEM=$HOME/.claude-memory
-WB=$HOME/.claude/projects/-workbench
-SEED=$HOME/.config/claude-loadout/seed-memory
-mkdir -p "$WB"
 
 # Abort a stalled transfer instead of holding activation until the timeout.
 export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=15
 
-# --- memory: a sparse clone of the memory repo, linked as this project's
-# auto-memory dir, so whatever Claude writes is a git change to review.
-linked=
-if [ -n "$REMOTE" ] && [ "$SLUG" != none ]; then
-    if [ ! -d "$MEM/.git" ]; then
-        rm -rf "$MEM"
-        git clone -q --filter=blob:none --no-checkout "$REMOTE" "$MEM" \
-            && git -C "$MEM" sparse-checkout set "$SUB" \
-            && git -C "$MEM" checkout -q \
-            || { rm -rf "$MEM"; say "memory clone of $REMOTE failed; memories will not sync"; }
-    fi
-    if [ -d "$MEM/.git" ]; then
-        target=$MEM/$SUB/projects/$SLUG
-        mkdir -p "$target"
-        [ -L "$WB/memory" ] || rm -rf "$WB/memory"
-        ln -sfn "$target" "$WB/memory" && linked=1
-        git -C "$MEM" config user.email >/dev/null 2>&1 || git config --global user.email >/dev/null 2>&1 \
-            || say "no git identity in the session; claude-mem keep will fail until one is set"
-        say "memory: $SUB/projects/$SLUG ($(ls "$target" 2>/dev/null | wc -l | tr -d ' ') files) synced with $REMOTE"
-    fi
-fi
-if [ -z "$linked" ]; then
-    mkdir -p "$WB/memory"
-    [ -d "$SEED" ] && cp -p "$SEED"/*.md "$WB/memory/" 2>/dev/null
-    say "memory: local copy only (set CLAUDE_LOADOUT_MEMORY_REMOTE on the host to sync)"
+# --- state: clone the state remote, link this project's memories as
+# -workbench/memory and copy in its recent transcripts (cwd -> /workbench).
+# claude-state logs its own one-line reason when there is nothing to load.
+cs=$HOME/.local/bin/claude-state
+if [ -x "$cs" ]; then
+    "$cs" session-activate || say "claude-state session-activate failed; the session starts without synced state"
+else
+    say "$cs missing; the session starts without synced state"
 fi
 
 # --- onboarding, and workspace trust only when asked for: trusting

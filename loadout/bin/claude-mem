@@ -1,33 +1,34 @@
 #!/bin/sh
 # claude-mem: review and git-sync Claude Code auto memories.
 #
-# A project's memories live in a git repo at
-#   $CLAUDE_LOADOUT_MEMORY_REPO/$CLAUDE_LOADOUT_MEMORY_SUBDIR/projects/<slug>/
+# Memories live in the state repo (claude-state) at
+#   $REPO/repos/<key>/memory/     key = normalized origin, e.g. github.com/o/r
+#   $REPO/local/<slug>/memory/    projects without an origin (host only)
 # and Claude's own memory dir (~/.claude/projects/<slug>/memory, or
-# -workbench/memory inside a min session) is a symlink to it. Anything
-# uncommitted there is "pending" until it is kept or discarded.
+# -workbench/memory inside a min session) is a symlink to it. Clones of one
+# repo share a key, so they share memories. Anything uncommitted there is
+# "pending" until it is kept or discarded.
 #
 # Only the host publishes to the repo's branch. A session reaches GitHub with
 # the same credential, so nothing server-side can stop it pushing there;
 # instead the host signs its commits, and `sync` refuses any upstream commit
 # to a checked-out path that is not signed by a key in the host-only
 # allowed-signers file. Inside a session, `keep` commits locally and sends
-# the result to pending/<session>/<slug>. `recover` on the host copies those
-# branches into an inbox outside every live memory dir, and `review` there
-# decides what reaches the repo.
+# the result to session/<name>. `recover` on the host copies the memories on
+# those branches into an inbox outside every live memory dir, and `review`
+# there decides what reaches the repo.
 #
 # Runs on the host and inside a session (POSIX sh, git; no jq).
 
 set -u
 
-SUBDIR=${CLAUDE_LOADOUT_MEMORY_SUBDIR:-memory}
 IN_SESSION=${CLAUDE_LOADOUT_IN_SESSION:-}
 if [ -n "${CLAUDE_LOADOUT_MEMORY_REPO:-}" ]; then
     REPO=$CLAUDE_LOADOUT_MEMORY_REPO
 elif [ -n "$IN_SESSION" ]; then
-    REPO=$HOME/.claude-memory
+    REPO=$HOME/.claude-state
 else
-    REPO=
+    REPO=${CLAUDE_STATE_DIR:-$HOME/.local/share/claude-state}
 fi
 INBOX=${XDG_STATE_HOME:-$HOME/.local/state}/claude-loadout/inbox
 SIGNERS=${XDG_CONFIG_HOME:-$HOME/.config}/claude-loadout/allowed_signers
@@ -35,19 +36,54 @@ SIGNERS=${XDG_CONFIG_HOME:-$HOME/.config}/claude-loadout/allowed_signers
 die() { echo "claude-mem: $*" >&2; exit 1; }
 note() { echo "claude-mem: $*" >&2; }
 
-# Host: the slug Claude derives from the project root. Session: inherited
-# from the host as CLAUDE_LOADOUT_SLUG.
 slug_for() { printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g'; }
-if [ -n "${CLAUDE_LOADOUT_SLUG:-}" ] && [ "${CLAUDE_LOADOUT_SLUG}" != none ]; then
-    SLUG=$CLAUDE_LOADOUT_SLUG
+
+# A key names a directory under repos/, so it must stay inside it.
+valid_key() {
+    case $1 in ''|/*|*/|*//*|*[!A-Za-z0-9._/-]*) return 1 ;; esac
+    case /$1/ in */../*|*/./*) return 1 ;; esac
+    return 0
+}
+
+# Normalized origin of the git checkout at $1, as `claude-state key` prints
+# it. The inline copy is the fallback for when claude-state is not installed.
+key_of() {
+    cs=$(dirname "$0")/claude-state
+    [ -x "$cs" ] || cs=$(command -v claude-state 2>/dev/null) || cs=
+    if [ -n "$cs" ]; then
+        k=$("$cs" key "$1" 2>/dev/null) || return 1
+    else
+        git -C "$1" rev-parse --git-dir >/dev/null 2>&1 || return 1
+        # The raw URL: `git remote get-url` applies insteadOf rewrites.
+        u=$(git -C "$1" config --get remote.origin.url) || return 1
+        case $u in
+            *://*) u=${u#*://} ;;
+            *:*) case ${u%%:*} in */*) ;; *) u=$(printf '%s' "$u" | sed 's/:/\//') ;; esac ;;
+        esac
+        u=$(printf '%s' "$u" | sed -e 's#/*$##' -e 's#\.git$##' -e 's#/*$##')
+        h=${u%%/*}; p=${u#"$h"}
+        h=${h##*@}; h=${h%%:*}  # credentials, port
+        k=$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')$p
+    fi
+    valid_key "$k" || return 1
+    printf '%s\n' "$k"
+}
+
+# The project: /workbench in a session, else the git root (or cwd) here.
+if [ -n "$IN_SESSION" ]; then
+    top=${CLAUDE_STATE_WORKBENCH:-/workbench}
 else
     top=$(git rev-parse --show-toplevel 2>/dev/null) || top=$PWD
-    SLUG=$(slug_for "$top")
 fi
+SLUG=$(slug_for "$top")
+KEY=$(key_of "$top") || KEY=
 SESSION=$(printf '%s' "${MINIMAL_SESSION_NAME:-$(hostname -s 2>/dev/null || echo host)}" | sed 's/[^A-Za-z0-9_-]/_/g')
 
-REL=$SUBDIR/projects/$SLUG      # repo-relative project memory dir
-DIR=$REPO/$REL
+if [ -n "$KEY" ]; then REL=repos/$KEY/memory; else REL=local/$SLUG/memory; fi
+DIR=$REPO/$REL                  # project memory dir
+ID=${REL%/memory}               # repos/<key> or local/<slug>
+inbox_dir() { printf '%s/%s' "$INBOX" "$(printf '%s' "$1" | tr / _)"; }
+IBX=$(inbox_dir "$ID")          # this project's review inbox
 
 need_repo() {
     [ -n "$REPO" ] || die "CLAUDE_LOADOUT_MEMORY_REPO is not set"
@@ -92,8 +128,8 @@ pending() {
 
 # Host: memories sessions sent for this project, awaiting review.
 inbox_names() {
-    [ -d "$INBOX/$SLUG" ] || return 0
-    ls "$INBOX/$SLUG" | while IFS= read -r n; do
+    [ -d "$IBX" ] || return 0
+    ls "$IBX" | while IFS= read -r n; do
         valid_name "$n" && printf '%s\n' "$n"
     done
 }
@@ -122,7 +158,7 @@ cmd_status() {
         return 0
     fi
     if [ -z "$p" ] && [ -z "$i" ]; then
-        echo "No pending memories for $SLUG."
+        echo "No pending memories for $ID."
         return 0
     fi
     if [ -n "$p" ]; then
@@ -140,7 +176,7 @@ cmd_status() {
     if [ -n "$i" ]; then
         echo "Sent from sessions, awaiting review (claude-mem review):"
         for n in $i; do
-            [ -e "$INBOX/$SLUG/$n.kept" ] && k="  (kept in the session)" || k=
+            [ -e "$IBX/$n.kept" ] && k="  (kept in the session)" || k=
             printf '  %s%s\n' "$n" "$k"
         done
     fi
@@ -178,7 +214,7 @@ cmd_keep() {
     [ -n "$names" ] || { echo "Nothing to keep."; return 0; }
     set --
     for name in $names; do set -- "$@" "$REL/$name"; done
-    g add -A -- "$@" && g commit -q --only -m "memory($SLUG): keep $names" -- "$@" \
+    g add -A -- "$@" && g commit -q --only -m "memory($ID): keep $names" -- "$@" \
         || die "commit failed"
     if [ -n "$IN_SESSION" ]; then
         echo "Kept: $names (sent to the host, which publishes it after its own review)"
@@ -233,12 +269,12 @@ cmd_review() {
     fi
     p=$(targets --all)
     i=$(inbox_names)
-    [ -n "$p$i" ] || { echo "No pending memories for $SLUG."; return 0; }
+    [ -n "$p$i" ] || { echo "No pending memories for $ID."; return 0; }
     keep=; drop=; quit=
-    echo "Review new Claude memories for $SLUG"
+    echo "Review new Claude memories for $ID"
     # Memories sessions sent: reviewed here before they touch the live dir.
     for name in $i; do
-        f=$INBOX/$SLUG/$name
+        f=$IBX/$name
         [ -e "$f.kept" ] && k=", kept there" || k=
         echo
         echo "────────── $name  (from a session$k)"
@@ -277,17 +313,16 @@ cmd_review() {
     return 0
 }
 
-# Send kept and pending memories to pending/<session>/<slug> without touching
-# the working tree: what `keep` does in a session, and the teardown safety
-# net when no one is there to review.
+# Send kept and pending memories to session/<name> without touching the
+# working tree: what `keep` does in a session. Session teardown
+# (claude-state) force-pushes the same branch with transcripts added.
 cmd_stash() {
     need_repo
-    b=pending/$SESSION/$SLUG
+    b=session/$SESSION
     up=$(g rev-parse -q --verify '@{u}' 2>/dev/null) || up=
     if [ -z "$(pending)" ] && [ "$(g rev-parse HEAD)" = "$up" ]; then
-        # Nothing left to send: drop an older branch so a later recover
-        # cannot bring back memories that were since discarded.
-        g push -q origin ":refs/heads/$b" >/dev/null 2>&1
+        # Nothing to send. An older branch is left alone: it may carry
+        # transcripts, and recover only files its memories for review.
         return 0
     fi
     commit=HEAD
@@ -309,16 +344,25 @@ cmd_stash() {
 # Host: copy one file a session changed into the inbox. Only flat *.md files
 # stored as plain blobs are taken, and they land under $INBOX, never in a
 # live memory dir. A MEMORY.md contributes just its new lines, each filed
-# beside the memory it points at.
+# beside the memory it points at. Paths outside a memory dir (transcripts,
+# which claude-state imports itself) are skipped without comment.
 inbox_one() {
     ref=$1 base=$2 kept=$3 f=$4
-    rel=${f#"$SUBDIR"/projects/}
-    s=${rel%%/*}; name=${rel#*/}
-    case $s in ''|*[!A-Za-z0-9-]*) note "ignored $f"; return 0 ;; esac
+    case $f in
+        repos/*/memory/*)
+            rel=${f#repos/}; key=${rel%/memory/*}; id=repos/$key
+            valid_key "$key" || { note "ignored $f"; return 0; } ;;
+        local/*/memory/*)
+            rel=${f#local/}; s=${rel%%/*}; id=local/$s
+            case $s in ''|*[!A-Za-z0-9-]*) note "ignored $f"; return 0 ;; esac ;;
+        *) return 0 ;;
+    esac
+    name=${f#"$id"/memory/}
+    [ "$f" = "$id/memory/$name" ] || { note "ignored $f"; return 0; }
     valid_name "$name" || { note "ignored $f"; return 0; }
     [ "$(g ls-tree "$ref" -- "$f" | cut -d' ' -f1)" = 100644 ] \
         || { note "ignored $f: not a regular file"; return 0; }
-    d=$INBOX/$s
+    d=$(inbox_dir "$id")
     mkdir -p "$d"
     if [ "$name" = MEMORY.md ]; then
         old=$(mktemp)
@@ -342,13 +386,13 @@ cmd_recover() {
     need_repo
     host_only recover
     case ${1:-} in
-        --all) pat=refs/remotes/origin/pending ;;
+        --all) pat=refs/remotes/origin/session ;;
         --session)
             [ -n "${2:-}" ] || die "usage: claude-mem recover --session <name> | --all"
-            pat=refs/remotes/origin/pending/$(printf '%s' "$2" | sed 's/[^A-Za-z0-9_-]/_/g') ;;
+            pat=refs/remotes/origin/session/$(printf '%s' "$2" | sed 's/[^A-Za-z0-9_-]/_/g') ;;
         *) die "usage: claude-mem recover --session <name> | --all" ;;
     esac
-    g fetch -q --prune origin "+refs/heads/pending/*:refs/remotes/origin/pending/*" 2>/dev/null || return 0
+    g fetch -q --prune origin "+refs/heads/session/*:refs/remotes/origin/session/*" 2>/dev/null || return 0
     # for-each-ref matches a pattern whole or up to a slash, so a session
     # name never matches another that merely starts with it.
     for ref in $(g for-each-ref --format='%(refname)' "$pat"); do
@@ -357,7 +401,7 @@ cmd_recover() {
             || { note "$b shares no history with $REPO; left on the remote"; continue; }
         kept=$ref
         case $(g log -1 --format=%s "$ref") in "claude-mem stash:"*) kept=$ref^ ;; esac
-        g diff --name-only --no-renames --diff-filter=AM "$base" "$ref" -- "$SUBDIR/projects" \
+        g diff --name-only --no-renames --diff-filter=AM "$base" "$ref" -- repos local \
             | while IFS= read -r f; do inbox_one "$ref" "$base" "$kept" "$f"; done
         g push -q origin ":refs/heads/$b" >/dev/null 2>&1
         g update-ref -d "$ref"
@@ -422,16 +466,34 @@ cmd_setup() {
     echo "trusted signers: $SIGNERS (add your other hosts' keys there)"
 }
 
+# Host: the project path behind a slug, from the "cwd" its newest transcript
+# records (a slug cannot be turned back into a path).
+slug_path() {
+    t=$(ls -t "$HOME/.claude/projects/$1"/*.jsonl 2>/dev/null | head -1)
+    [ -n "$t" ] || return 1
+    p=$(grep -o '"cwd":"[^"]*"' "$t" | tail -1 | sed 's/^"cwd":"//; s/"$//')
+    [ -n "$p" ] && printf '%s\n' "$p"
+}
+
 # Host only: make ~/.claude/projects/<slug>/memory a symlink into the repo,
-# migrating whatever is there first. Migrated files are pending until
-# reviewed, or committed (not pushed) with --commit.
+# migrating whatever is there first: to repos/<key>/memory (key given, or
+# from the slug's project path), else local/<slug>/memory. Clones of one
+# repo share a key and so link to the same dir. Migrated files are pending
+# until reviewed, or committed (not pushed) with --commit.
 link_one() {
-    s=$1 commit=$2
+    s=$1 commit=$2 key=${3:-}
+    case $s in ''|*[!A-Za-z0-9-]*) note "ignored slug '$s'"; return 0 ;; esac
     host=$HOME/.claude/projects/$s/memory
-    target=$REPO/$SUBDIR/projects/$s
     if [ -L "$host" ]; then
         return 0
     fi
+    if [ -n "$key" ]; then
+        valid_key "$key" || die "invalid key '$key'"
+    else
+        p=$(slug_path "$s") && key=$(key_of "$p") || key=
+    fi
+    if [ -n "$key" ]; then r=repos/$key/memory; else r=local/$s/memory; fi
+    target=$REPO/$r
     mkdir -p "$target" "$(dirname "$host")"
     if [ -d "$host" ]; then
         for f in "$host"/* "$host"/.[!.]*; do
@@ -447,7 +509,6 @@ link_one() {
         bak=${XDG_STATE_HOME:-$HOME/.local/state}/claude-loadout/memory-backup/$s-$(date +%Y%m%d%H%M%S)
         mkdir -p "$(dirname "$bak")"
         mv "$host" "$bak"
-        r=$SUBDIR/projects/$s
         if [ -n "$(g status --porcelain=v1 -uall -- "$r")" ]; then
             if [ -n "$commit" ]; then
                 g add -A -- "$r" && g commit -q --only -m "memory($s): import from host" -- "$r"
@@ -473,7 +534,7 @@ cmd_link() {
             s=${d%/memory}; link_one "${s##*/}" "$commit"
         done
     else
-        link_one "${1:-$SLUG}" "$commit"
+        if [ -n "${1:-}" ]; then link_one "$1" "$commit" "${2:-}"; else link_one "$SLUG" "$commit" "$KEY"; fi
     fi
 }
 
@@ -485,12 +546,14 @@ usage: claude-mem <command>
   keep [--no-push] <file>...|--all   host: commit and publish; session: commit and send to the host
   discard <file>...|--all       drop pending memories (and their index lines)
   review [--if-pending]         interactive keep/discard
-  stash                         send kept and pending memories to pending/<session>/<slug>
-  recover --session <name>|--all  host: copy pending/* branches into the review inbox, delete them
+  stash                         send kept and pending memories to session/<name>
+  recover --session <name>|--all  host: copy memories on session/* branches into the review inbox, delete them
   sync                          host: take signed upstream commits, publish local ones
   setup [<key.pub>]             host: sign memory commits with an SSH key and trust it
-  link [--commit] [<slug>|--all]   host: symlink ~/.claude/projects/<slug>/memory into the repo
-project: $SLUG
+  link [--commit] [<slug> [<key>]|--all]
+                                host: symlink ~/.claude/projects/<slug>/memory to repos/<key>/memory
+                                (key from the slug's project origin) or local/<slug>/memory
+project: $ID  (slug $SLUG)
 repo:    ${REPO:-<unset>}
 EOF
 }

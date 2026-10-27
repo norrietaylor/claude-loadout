@@ -1,0 +1,691 @@
+#!/bin/sh
+# shellcheck disable=SC2015,SC2016 # "a && b || fail" is meant; jq programs are single-quoted
+# claude-state: move Claude Code memories and recent transcripts between the
+# host, a private git remote (the "state remote") and min sessions.
+#
+# Remote layout (branch main, written only by the host, commits signed):
+#   index.json                             repo key -> host slugs and paths
+#   repos/<key>/memory/*.md                key = normalized origin
+#   repos/<key>/transcripts/<uuid>.jsonl   (+ <uuid>/ sidecar dir)
+#   local/<slug>/memory/*.md               projects without an origin
+#
+# Host (Claude Code hooks): `pull` at SessionStart takes signed upstream and
+# imports what sessions sent on session/<name> branches; `push` at SessionEnd
+# publishes the project's transcripts. Session (loadout lifecycle hooks):
+# `session-activate`, `session-attach`, `session-teardown`.
+#
+# A transcript keeps the cwd of whoever wrote it; each reader rewrites it to
+# its own path on import (/workbench in a session, the project path on the
+# host). What comes back from a session is untrusted: memories go to the
+# review inbox (claude-mem recover), transcripts are taken only as plain,
+# size-capped files that are new to the host or extend its copy byte for byte.
+#
+# POSIX sh, git, jq.
+
+set -u
+
+IN_SESSION=${CLAUDE_LOADOUT_IN_SESSION:-}
+PROJECTS=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/claude-loadout
+REMOTE_FILE=$HOME/.config/claude-loadout/remote
+# Only tests point this elsewhere.
+WORKBENCH=${CLAUDE_STATE_WORKBENCH:-/workbench}
+WB=$PROJECTS/-workbench
+if [ -n "$IN_SESSION" ]; then
+    REPO=$HOME/.claude-state
+else
+    REPO=${CLAUDE_STATE_DIR:-$HOME/.local/share/claude-state}
+fi
+MAX_FILES=${CLAUDE_LOADOUT_HISTORY_MAX:-20}
+MAX_MB=${CLAUDE_LOADOUT_HISTORY_MB:-80}
+FILE_MB=${CLAUDE_LOADOUT_FILE_MB:-50}
+PULL_MB=${CLAUDE_LOADOUT_PULL_MB:-512}
+MB=1048576
+
+# Abort a stalled transfer instead of holding a hook until its timeout.
+export GIT_HTTP_LOW_SPEED_LIMIT="${GIT_HTTP_LOW_SPEED_LIMIT:-1000}" GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-15}"
+
+die() { echo "claude-state: $*" >&2; exit 1; }
+note() { echo "claude-state: $*" >&2; }
+
+g() { git -C "$REPO" "$@"; }
+
+# claude-mem beside this script (the loadout installs both), always pointed
+# at this repo so an old CLAUDE_LOADOUT_MEMORY_REPO cannot split the two.
+MEM_BIN=$(dirname "$0")/claude-mem
+[ -x "$MEM_BIN" ] || MEM_BIN=claude-mem
+mem() { CLAUDE_LOADOUT_MEMORY_REPO=$REPO "$MEM_BIN" "$@"; }
+
+# One scratch dir per run, and the host lock, released however we exit.
+TMPD=
+LOCKED=
+cleanup() {
+    [ -z "$TMPD" ] || rm -rf "$TMPD"
+    [ -z "$LOCKED" ] || rmdir "$STATE/lock" 2>/dev/null
+}
+trap cleanup EXIT
+trap 'exit 1' INT TERM HUP
+scratch() { [ -n "$TMPD" ] || TMPD=$(mktemp -d) || die "mktemp failed"; }
+
+# Host: pull and push touch the same clone and may run from several Claude
+# sessions at once. A lock older than 10 minutes is a crashed run.
+lock() {
+    mkdir -p "$STATE"
+    n=0
+    while ! mkdir "$STATE/lock" 2>/dev/null; do
+        [ -n "$(find "$STATE/lock" -maxdepth 0 -mmin +10 2>/dev/null)" ] && rmdir "$STATE/lock" 2>/dev/null
+        n=$((n + 1))
+        [ "$n" -lt "$1" ] || return 1
+        sleep 1
+    done
+    LOCKED=1
+}
+
+host_only() { [ -z "$IN_SESSION" ] || die "$1 is host-only"; }
+session_only() { [ -n "$IN_SESSION" ] || die "$1 runs inside a min session"; }
+
+slug_for() { printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g'; }
+fsize() { wc -c < "$1" | tr -d ' '; }
+
+# A key names a directory under repos/, so it must stay inside it.
+valid_key() {
+    case $1 in ''|/*|*/|*//*|*[!A-Za-z0-9._/-]*) return 1 ;; esac
+    case /$1/ in */../*|*/./*) return 1 ;; esac
+    return 0
+}
+valid_uuid() { case $1 in ''|*[!A-Za-z0-9-]*) return 1 ;; esac; }
+# A path inside a sidecar dir: plain components, none starting with a dot.
+valid_rel() {
+    case $1 in ''|*[!A-Za-z0-9._/-]*) return 1 ;; esac
+    case /$1/ in */.*|*//*) return 1 ;; esac
+    return 0
+}
+
+# --- key ---------------------------------------------------------------------
+
+# The raw origin URL: `git remote get-url` applies insteadOf rewrites, and in
+# a session the broker rewrites github.com to itself.
+normalize() {
+    u=$1
+    case $u in
+        *://*) u=${u#*://} ;;
+        *:*) case ${u%%:*} in */*) ;; *) u=${u%%:*}/${u#*:} ;; esac ;;   # scp form
+    esac
+    u=$(printf '%s' "$u" | sed -e 's#/*$##' -e 's#\.git$##' -e 's#/*$##')
+    h=${u%%/*}; p=${u#"$h"}
+    h=${h##*@}; h=${h%%:*}  # credentials, port
+    printf '%s%s\n' "$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')" "$p"
+}
+
+key_of() {
+    git -C "$1" rev-parse --git-dir >/dev/null 2>&1 || return 1
+    u=$(git -C "$1" config --get remote.origin.url) || return 1
+    k=$(normalize "$u")
+    valid_key "$k" || return 1
+    printf '%s\n' "$k"
+}
+
+cmd_key() {
+    d=${1:-}
+    [ -n "$d" ] || d=$(git rev-parse --show-toplevel 2>/dev/null) || exit 1
+    key_of "$d" || exit 1
+}
+
+# --- transcripts ---------------------------------------------------------------
+
+# Sort key for "newest": the last "timestamp" in the file's final 4 KB (ISO
+# strings sort lexically), else its mtime in the same form.
+stamp() {
+    t=$(tail -c 4096 "$1" | grep -o '"timestamp":"[^"]*"' | tail -1 | cut -d'"' -f4)
+    [ -n "$t" ] || t=$(date -u -r "$1" +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null)
+    printf '%s\n' "${t:-0}"
+}
+
+# stdin: transcript paths; stdout: the same, newest first.
+by_newest() {
+    while IFS= read -r f; do printf '%s\t%s\n' "$(stamp "$f")" "$f"; done | sort -r | cut -f2-
+}
+
+# Plain files of a transcript's sidecar dir, relative to it, each under the
+# per-file cap. find does not follow links, so a link is never one of them.
+sidecar() {
+    [ -d "$1" ] && [ ! -L "$1" ] || return 0
+    (cd "$1" && find . -type f -size -$((FILE_MB * MB + 1))c) | while IFS= read -r r; do
+        r=${r#./}
+        valid_rel "$r" && printf '%s\n' "$r"
+    done
+}
+
+tsize() {
+    s=$(fsize "$1")
+    d=${1%.jsonl}
+    for r in $(sidecar "$d"); do s=$((s + $(fsize "$d/$r"))); done
+    echo "$s"
+}
+
+# stdin: transcripts newest first; stdout: those within the caps.
+cap_select() {
+    n=0; total=0
+    while IFS= read -r f; do
+        [ "$n" -lt "$MAX_FILES" ] || break
+        [ "$(fsize "$f")" -le $((FILE_MB * MB)) ] || continue
+        s=$(tsize "$f")
+        [ $((total + s)) -le $((MAX_MB * MB)) ] || continue
+        printf '%s\n' "$f"
+        n=$((n + 1)); total=$((total + s))
+    done
+}
+
+# Transcripts directly in a dir with a valid uuid name.
+transcripts_in() {
+    for f in "$1"/*.jsonl; do
+        [ -f "$f" ] && [ ! -L "$f" ] || continue
+        b=${f##*/}
+        valid_uuid "${b%.jsonl}" && printf '%s\n' "$f"
+    done
+}
+
+# A sed expression replacing "cwd":"FROM with "cwd":"TO where FROM is followed
+# by / or ": line-preserving, so a rewritten copy is byte-deterministic.
+sed_expr() {
+    from=$(printf '%s' "$1" | sed 's/[]\\|.*^$[]/\\&/g')
+    to=$(printf '%s' "$2" | sed 's/[\\|&]/\\&/g')
+    printf 's|"cwd":"%s\\([/"]\\)|"cwd":"%s\\1|g\n' "$from" "$to"
+}
+# rewrite TO FROM... < in > out (longest FROM first, so a nested path wins)
+rewrite() {
+    to=$1; shift
+    scratch
+    : > "$TMPD/rw.sed"
+    for p; do printf '%s\t%s\n' "${#p}" "$p"; done | sort -rn | cut -f2- | while IFS= read -r p; do
+        [ -z "$p" ] || [ "$p" = "$to" ] || sed_expr "$p" "$to" >> "$TMPD/rw.sed"
+    done
+    LC_ALL=C sed -f "$TMPD/rw.sed"
+}
+
+# install SRC DEST: take SRC when DEST is missing or SRC extends it byte for
+# byte (transcripts are append-only). Anything else would rewrite history the
+# reader already has. SRC is consumed only when installed.
+install_if_extends() {
+    if [ -e "$2" ]; then
+        old=$(fsize "$2"); new=$(fsize "$1")
+        [ "$new" -gt "$old" ] || return 1
+        if ! head -c "$old" "$1" | cmp -s - "$2"; then
+            note "${2#"$HOME"/}: incoming copy does not extend this one; kept this one"
+            return 1
+        fi
+    fi
+    mkdir -p "${2%/*}"
+    mv "$1" "$2"
+}
+
+# --- host: publish -------------------------------------------------------------
+
+repo_ready() {
+    git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || { note "no state clone at $REPO (claude-state init)"; return 1; }
+}
+# Host commits go through the repo's signing config; unsigned ones would be
+# refused by every other host's sync.
+signing_ready() { [ "$(g config --bool commit.gpgsign)" = true ] && [ -n "$(g config user.signingkey)" ]; }
+
+# publish KEY: copy the transcripts on stdin into repos/KEY/transcripts (new,
+# or extending the stored copy), then trim the key to the caps.
+publish() {
+    dest=$REPO/repos/$1/transcripts
+    scratch
+    while IFS= read -r f; do
+        b=${f##*/}; u=${b%.jsonl}
+        cp "$f" "$TMPD/t" && install_if_extends "$TMPD/t" "$dest/$b"
+        for r in $(sidecar "${f%.jsonl}"); do
+            cp "${f%.jsonl}/$r" "$TMPD/t" && install_if_extends "$TMPD/t" "$dest/$u/$r"
+        done
+    done
+    keep=$(transcripts_in "$dest" | by_newest | cap_select)
+    for f in "$dest"/*.jsonl; do
+        [ -e "$f" ] || continue
+        printf '%s\n' "$keep" | grep -qxF -- "$f" && continue
+        rm -rf "$f" "${f%.jsonl}"
+    done
+    return 0
+}
+
+index_file() { printf '%s/index.json' "$REPO"; }
+ensure_index() {
+    [ -s "$(index_file)" ] || printf '{"version":1,"repos":{},"local":{}}\n' > "$(index_file)"
+}
+# jq FILTER over index.json in place.
+index_jq() {
+    ensure_index
+    jq "$@" "$(index_file)" > "$(index_file).tmp" && mv "$(index_file).tmp" "$(index_file)" \
+        || { rm -f "$(index_file).tmp"; return 1; }
+}
+# index_primary KEY SLUG PATH: make SLUG/PATH the key's primary clone.
+index_primary() {
+    index_jq --arg k "$1" --arg s "$2" --arg p "$3" '
+        .repos[$k] = ((.repos[$k] // {}) as $e
+          | ($e.slugs // []) as $ss | ($e.paths // [])  as $ps
+          | [range(0; $ss | length) | {s: $ss[.], p: $ps[.]}] as $pairs
+          | ([{s: $s, p: $p}] + [$pairs[] | select(.s != $s)]) as $all
+          | $e + {slugs: [$all[].s], paths: [$all[].p]})'
+}
+
+# commit MESSAGE PATH...: one signed commit of just these paths (memory dirs
+# in the same work tree may hold pending files that are not ours to commit).
+commit_paths() {
+    m=$1; shift
+    g add -A -- "$@" || return 1
+    g diff --cached --quiet -- "$@" && return 0
+    g commit -q --only -m "$m" -- "$@"
+}
+
+# --- host: init / seed ---------------------------------------------------------
+
+strip_creds() { printf '%s\n' "$1" | sed 's#://[^/@]*@#://#'; }
+
+cmd_init() {
+    host_only init
+    command -v jq >/dev/null || die "jq is required"
+    if [ ! -d "$REPO/.git" ]; then
+        command -v gh >/dev/null || die "gh is required to create the state remote"
+        name=${CLAUDE_STATE_REPO:-}
+        if [ -z "$name" ]; then
+            user=$(gh api user --jq .login) || die "gh api user failed (gh auth login?)"
+            name=$user/claude-state
+        fi
+        gh repo view "$name" >/dev/null 2>&1 || gh repo create "$name" --private >/dev/null \
+            || die "could not create $name"
+        mkdir -p "$(dirname "$REPO")"
+        gh repo clone "$name" "$REPO" -- -q || die "could not clone $name to $REPO"
+    fi
+    # Seeding commits, and they must be signed.
+    # Before seeding, which commits. setup is idempotent and reports its own
+    # failure (no key, no user.email; git falls back to the global identity).
+    signing_ready || mem setup || exit 1
+    if ! g rev-parse -q --verify HEAD >/dev/null; then
+        # A new, empty remote: start main with an empty index.
+        g symbolic-ref HEAD refs/heads/main
+        ensure_index
+        g add index.json && g commit -q -m "claude-state: init" && g push -q -u origin main \
+            || die "could not publish the first commit to $(g config remote.origin.url)"
+    fi
+    url=$(g config --get remote.origin.url) || die "$REPO has no origin"
+    mkdir -p "${REMOTE_FILE%/*}"
+    strip_creds "$url" > "$REMOTE_FILE"
+    echo "state remote: $(cat "$REMOTE_FILE") (clone: $REPO)"
+    cmd_seed
+}
+
+# The project path behind a slug dir: the "cwd" of its newest transcript that
+# maps back to the slug (a session may have moved; a slug cannot be reversed).
+slug_path() {
+    t=$(transcripts_in "$1" | by_newest | head -1)
+    [ -n "$t" ] || return 1
+    s=${1##*/}
+    first=
+    cwds=$(grep -o '"cwd":"[^"\\]*"' "$t" | cut -d'"' -f4 | awk '!seen[$0]++')
+    [ -n "$cwds" ] || return 1
+    while IFS= read -r p; do
+        [ -n "$first" ] || first=$p
+        [ "$(slug_for "$p")" = "$s" ] && { printf '%s\n' "$p"; return 0; }
+    done <<EOF
+$cwds
+EOF
+    printf '%s\n' "$first"
+}
+
+has_memory() { [ -n "$(ls -A "$1/memory" 2>/dev/null)" ]; }
+
+cmd_seed() {
+    host_only seed
+    command -v jq >/dev/null || die "jq is required"
+    repo_ready || exit 1
+    signing_ready || die "memory commits are not signed yet; run: claude-mem setup"
+    lock 60 || die "another claude-state run holds $STATE/lock"
+    scratch
+    ensure_index
+    : > "$TMPD/found"           # stamp TAB key TAB slug TAB path
+    for d in "$PROJECTS"/*/; do
+        d=${d%/}; s=${d##*/}
+        [ -d "$d" ] || continue
+        case $s in -workbench|*[!A-Za-z0-9-]*) continue ;; esac
+        # Only projects whose path a transcript names and that still exist:
+        # a slug cannot be reversed reliably, so memory with no transcript
+        # (or of a deleted project) stays where it is.
+        newest=$(transcripts_in "$d" | by_newest | head -1)
+        [ -n "$newest" ] || continue
+        p=$(slug_path "$d") || continue
+        [ -d "$p" ] || continue
+        if k=$(key_of "$p"); then
+            printf '%s\t%s\t%s\t%s\n' "$(stamp "$newest")" "$k" "$s" "$p" >> "$TMPD/found"
+        elif has_memory "$d"; then
+            printf '%s\t%s\t%s\t%s\n' 0 - "$s" "$p" >> "$TMPD/found"
+        fi
+    done
+
+    # Memory dirs: a link left by the old layout (into another repo) is
+    # replaced by a copy of what it points at, so link migrates it here.
+    while IFS="$(printf '\t')" read -r _ k s p; do
+        m=$PROJECTS/$s/memory
+        if [ -L "$m" ]; then
+            case $(cd "$m" 2>/dev/null && pwd -P) in "$(cd "$REPO" && pwd -P)"/*) ;; *)
+                if [ -d "$m" ]; then
+                    cp -RL "$m" "$m.seed.$$" && rm "$m" && mv "$m.seed.$$" "$m" \
+                        || { note "$s: could not copy linked memory dir; left as is"; continue; }
+                fi ;;
+            esac
+        fi
+        has_memory "$PROJECTS/$s" || [ -L "$m" ] || continue
+        if [ "$k" = - ]; then mem link --commit "$s"; else mem link --commit "$s" "$k"; fi \
+            || note "$s: memory link failed"
+    done < "$TMPD/found"
+
+    # Index (newest clone first) and transcripts, per key.
+    sort -r "$TMPD/found" > "$TMPD/sorted"
+    # shellcheck disable=SC2013 # keys are validated: no spaces or globs
+    for k in $(cut -f2 "$TMPD/sorted" | grep -vx -- - | awk '!seen[$0]++'); do
+        awk -F '\t' -v k="$k" '$2 == k' "$TMPD/sorted" | sort | while IFS="$(printf '\t')" read -r _ _ s p; do
+            index_primary "$k" "$s" "$p"
+        done
+        awk -F '\t' -v k="$k" '$2 == k {print $3}' "$TMPD/sorted" | while IFS= read -r s; do
+            transcripts_in "$PROJECTS/$s"
+        done | by_newest | cap_select | publish "$k"
+    done
+    awk -F '\t' '$2 == "-"' "$TMPD/sorted" | while IFS="$(printf '\t')" read -r _ _ s p; do
+        index_jq --arg s "$s" --arg p "$p" '.local[$s] = ((.local[$s] // {}) + {path: $p})'
+    done
+    commit_paths "claude-state: seed from $(hostname -s 2>/dev/null || echo host)" index.json repos \
+        || die "seed commit failed"
+    mem sync || note "sync failed; commits are local in $REPO (claude-mem sync)"
+    echo "seeded $(grep -vc "	-	" "$TMPD/found" | tr -d ' ') repo clone(s), $(grep -c "	-	" "$TMPD/found" | tr -d ' ') local project(s)"
+}
+
+# --- host: pull ------------------------------------------------------------------
+
+# Import the transcripts a session branch changed, for every key the index
+# knows, into that key's primary slug with /workbench rewritten to its path.
+import_branch() {
+    ref=$1 name=$2
+    base=$(g merge-base HEAD "$ref" 2>/dev/null) || return 0
+    budget=$((PULL_MB * MB)); taken=0; n=0
+    scratch
+    jq -r '.repos | keys[]' "$(index_file)" 2>/dev/null > "$TMPD/keys" || return 0
+    while IFS= read -r k; do
+        valid_key "$k" || continue
+        slug=$(jq -r --arg k "$k" '.repos[$k].slugs[0] // empty' "$(index_file)")
+        path=$(jq -r --arg k "$k" '.repos[$k].paths[0] // empty' "$(index_file)")
+        case $slug in ''|*[!A-Za-z0-9-]*) continue ;; esac
+        [ -n "$path" ] || continue
+        pre=repos/$k/transcripts/
+        g diff --name-only --no-renames --diff-filter=AM "$base" "$ref" -- "$pre" > "$TMPD/changed"
+        while IFS= read -r f; do
+            r=${f#"$pre"}
+            case $r in
+                */*) valid_uuid "${r%%/*}" && valid_rel "${r#*/}" || { note "$name: ignored $f"; continue; } ;;
+                *.jsonl) valid_uuid "${r%.jsonl}" || { note "$name: ignored $f"; continue; } ;;
+                *) note "$name: ignored $f"; continue ;;
+            esac
+            [ "$(g ls-tree "$ref" -- "$f" | cut -d' ' -f1)" = 100644 ] \
+                || { note "$name: ignored $f: not a regular file"; continue; }
+            s=$(g cat-file -s "$ref:$f") || continue
+            [ "$s" -le $((FILE_MB * MB)) ] || { note "$name: skipped $f: over $FILE_MB MB"; continue; }
+            [ $((taken + s)) -le "$budget" ] \
+                || { note "$name: over $PULL_MB MB of transcripts; the rest not imported (raise CLAUDE_LOADOUT_PULL_MB)"; break; }
+            taken=$((taken + s))
+            g cat-file blob "$ref:$f" > "$TMPD/in" || continue
+            case $r in
+                *.jsonl) rewrite "$path" "$WORKBENCH" < "$TMPD/in" > "$TMPD/out" ;;
+                *) mv "$TMPD/in" "$TMPD/out" ;;
+            esac
+            install_if_extends "$TMPD/out" "$PROJECTS/$slug/$r" || continue
+            case $r in *.jsonl) n=$((n + 1)) ;; esac
+        done < "$TMPD/changed"
+    done < "$TMPD/keys"
+    [ "$n" -eq 0 ] || echo "claude-state: imported $n transcript(s) from session $name"
+}
+
+cmd_pull() {
+    host_only pull
+    hook=
+    if [ "${1:-}" = --hook ]; then
+        hook=1
+        # SessionStart JSON is not needed; stdout would land in Claude's
+        # context, so everything goes to a log.
+        cat > /dev/null
+        mkdir -p "$STATE"
+        exec >> "$STATE/pull.log" 2>&1
+        echo "--- pull $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    fi
+    command -v jq >/dev/null || { note "jq is required"; [ -n "$hook" ] && exit 0; exit 1; }
+    [ -d "$REPO/.git" ] || { note "no state clone at $REPO (claude-state init)"; [ -n "$hook" ] && exit 0; exit 1; }
+    if ! lock 10; then note "another claude-state run holds $STATE/lock; skipped"; exit 0; fi
+    mem sync || note "sync did not complete"
+    if ! g fetch -q --prune origin "+refs/heads/session/*:refs/remotes/origin/session/*"; then
+        note "fetch failed; session branches not imported"
+        exit 0
+    fi
+    for ref in $(g for-each-ref --format='%(refname)' refs/remotes/origin/session/); do
+        name=${ref#refs/remotes/origin/session/}
+        case $name in ''|*[!A-Za-z0-9_-]*) note "ignored branch session/$name"; continue ;; esac
+        # Transcripts first: recover deletes the branch.
+        import_branch "$ref" "$name"
+        mem recover --session "$name" || note "recover of session/$name failed"
+    done
+    exit 0
+}
+
+# --- host: push -------------------------------------------------------------------
+
+cmd_push() {
+    host_only push
+    if [ "${1:-}" = --hook ]; then
+        # Read the SessionEnd JSON now, then let Claude exit while git runs.
+        input=$(cat)
+        cwd=$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)
+        tp=$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null)
+        [ -n "$cwd" ] || exit 0
+        slug=
+        case $tp in "$PROJECTS"/*/*.jsonl)
+            slug=${tp#"$PROJECTS"/}; slug=${slug%%/*} ;;
+        esac
+        mkdir -p "$STATE"
+        {
+            echo "--- push $(date -u +%Y-%m-%dT%H:%M:%SZ) $cwd"
+            nohup sh "$0" push "$cwd" "$slug" < /dev/null &
+        } >> "$STATE/push.log" 2>&1
+        exit 0
+    fi
+    path=${1:-$PWD}
+    slug=${2:-}
+    [ -n "$slug" ] || slug=$(slug_for "$path")
+    case $slug in *[!A-Za-z0-9-]*) die "invalid slug '$slug'" ;; esac
+    command -v jq >/dev/null || die "jq is required"
+    repo_ready || exit 1
+    # Transcripts are stored only for projects with an origin.
+    k=$(key_of "$path") || { note "$path has no origin; transcripts are not published"; return 0; }
+    signing_ready || die "memory commits are not signed yet; run: claude-mem setup"
+    lock 120 || die "another claude-state run holds $STATE/lock"
+    mem sync || note "sync did not complete; publishing on top of the local clone"
+    transcripts_in "$PROJECTS/$slug" | by_newest | cap_select | publish "$k"
+    index_primary "$k" "$slug" "$path" || die "could not update index.json"
+    commit_paths "claude-state: transcripts of $k" index.json "repos/$k/transcripts" || die "commit failed"
+    mem sync || note "sync failed; commits are local in $REPO (claude-mem sync)"
+}
+
+# --- session -----------------------------------------------------------------------
+
+# Transcripts activate/attach installed, "<rel> <size>" per line, so teardown
+# sends only what the session wrote or extended.
+MANIFEST=$REPO/.git/claude-state-imported
+manifest_set() {
+    { awk -v r="$1" '$1 != r' "$MANIFEST" 2>/dev/null
+      printf '%s %s\n' "$1" "$(fsize "$WB/$1")"; } > "$MANIFEST.tmp" && mv "$MANIFEST.tmp" "$MANIFEST"
+}
+manifest_has() { grep -qxF -- "$1 $(fsize "$WB/$1")" "$MANIFEST" 2>/dev/null; }
+
+# Copy the key's transcripts from the clone into -workbench, cwd rewritten
+# from every host path of the key to /workbench; only new files or files
+# that extend the session's copy.
+session_import() {
+    k=$1
+    src=$REPO/repos/$k/transcripts
+    [ -d "$src" ] || return 0
+    scratch
+    jq -r --arg k "$k" '.repos[$k].paths[]? // empty' "$REPO/index.json" 2>/dev/null > "$TMPD/paths"
+    set --
+    while IFS= read -r p; do [ -z "$p" ] || set -- "$@" "$p"; done < "$TMPD/paths"
+    n=0
+    for f in $(transcripts_in "$src" | tr '\n' ' '); do
+        b=${f##*/}; u=${b%.jsonl}
+        rewrite "$WORKBENCH" "$@" < "$f" > "$TMPD/t"
+        if install_if_extends "$TMPD/t" "$WB/$b"; then manifest_set "$b"; n=$((n + 1)); fi
+        for r in $(sidecar "$src/$u"); do
+            case $r in
+                *.jsonl) rewrite "$WORKBENCH" "$@" < "$src/$u/$r" > "$TMPD/t" ;;
+                *) cp "$src/$u/$r" "$TMPD/t" ;;
+            esac
+            install_if_extends "$TMPD/t" "$WB/$u/$r" && manifest_set "$u/$r"
+        done
+    done
+    echo "claude: transcripts: $n imported for $k"
+}
+
+cmd_session_activate() {
+    session_only session-activate
+    mkdir -p "$WB"
+    url=$(cat "$REMOTE_FILE" 2>/dev/null) || url=
+    [ -n "$url" ] || { echo "claude: no state remote ($REMOTE_FILE missing); starting without synced state"; return 0; }
+    k=$(key_of "$WORKBENCH") || { echo "claude: $WORKBENCH has no git origin; starting without synced state"; return 0; }
+    if [ ! -d "$REPO/.git" ]; then
+        rm -rf "$REPO"
+        # Blobs only for the sparse set; cone mode keeps top-level files
+        # (index.json) too.
+        if ! { git clone -q --filter=blob:none --no-checkout "$url" "$REPO" \
+                && g sparse-checkout init --cone \
+                && g sparse-checkout set "repos/$k" \
+                && g checkout -q; }; then
+            rm -rf "$REPO"
+            echo "claude: clone of the state remote failed; starting without synced state"
+            return 0
+        fi
+    fi
+    jq -e --arg k "$k" '.repos[$k]' "$REPO/index.json" >/dev/null 2>&1 \
+        || echo "claude: no state for $k yet; starting empty"
+    # Link even an empty dir: memories written here still reach the host.
+    target=$REPO/repos/$k/memory
+    mkdir -p "$target"
+    if [ -d "$WB/memory" ] && [ ! -L "$WB/memory" ]; then
+        if [ -n "$(ls -A "$WB/memory")" ]; then mv "$WB/memory" "$WB/memory.local.$$"; else rmdir "$WB/memory"; fi
+    fi
+    ln -sfn "$target" "$WB/memory"
+    git -C "$REPO" config user.email >/dev/null 2>&1 \
+        || echo "claude: no git identity in the session; claude-mem keep will fail until one is set"
+    # shellcheck disable=SC2012 # memory names are plain; this is a count
+    echo "claude: memory: repos/$k/memory ($(ls "$target" | wc -l | tr -d ' ') files)"
+    session_import "$k"
+}
+
+cmd_session_attach() {
+    session_only session-attach
+    [ -d "$REPO/.git" ] || return 0
+    k=$(key_of "$WORKBENCH") || return 0
+    if g fetch -q origin; then
+        up=$(g rev-parse -q --verify '@{u}') || up=origin/main
+        if ! g rebase -q --autostash "$up" >/dev/null 2>&1; then
+            g rebase --abort >/dev/null 2>&1
+            echo "claude: could not rebase the state clone onto $up; memories stay as they were"
+        fi
+    else
+        echo "claude: fetch of the state remote failed"
+    fi
+    session_import "$k"
+}
+
+cmd_session_teardown() {
+    session_only session-teardown
+    [ -d "$REPO/.git" ] || return 0
+    k=$(key_of "$WORKBENCH") || return 0
+    name=$(printf '%s' "${MINIMAL_SESSION_NAME:-}" | sed 's/[^A-Za-z0-9_-]/_/g')
+    [ -n "$name" ] || { echo "claude: MINIMAL_SESSION_NAME unset; nothing sent"; return 0; }
+    # commit-tree needs an identity; the session may not have one.
+    g config user.email >/dev/null 2>&1 || {
+        export GIT_AUTHOR_NAME=claude-session GIT_AUTHOR_EMAIL=session@localhost
+        export GIT_COMMITTER_NAME=claude-session GIT_COMMITTER_EMAIL=session@localhost
+    }
+    scratch
+    idx=$TMPD/index
+    mrel=repos/$k/memory
+    GIT_INDEX_FILE=$idx g read-tree HEAD || return 0
+    pending=
+    if [ -n "$(g status --porcelain=v1 -uall -- "$mrel" 2>/dev/null)" ]; then
+        pending=1
+        GIT_INDEX_FILE=$idx g add -A -- "$mrel" || return 0
+    fi
+    # Transcripts the session wrote or extended since activate/attach,
+    # newest first, plain files under the caps; cwd stays /workbench.
+    trel=repos/$k/transcripts
+    budget=$((PULL_MB * MB)); total=0; n=0
+    for f in $(transcripts_in "$WB" | by_newest | tr '\n' ' '); do
+        b=${f##*/}; u=${b%.jsonl}
+        set -- "$b"
+        for r in $(sidecar "$WB/$u"); do set -- "$@" "$u/$r"; done
+        for r; do
+            manifest_has "$r" && continue
+            s=$(fsize "$WB/$r")
+            [ "$s" -le $((FILE_MB * MB)) ] || continue
+            [ $((total + s)) -le "$budget" ] || break 2
+            sha=$(g hash-object -w -- "$WB/$r") || continue
+            GIT_INDEX_FILE=$idx g update-index --add --cacheinfo "100644,$sha,$trel/$r" || continue
+            total=$((total + s))
+            case $r in *.jsonl) n=$((n + 1)) ;; esac
+        done
+    done
+    up=$(g rev-parse -q --verify '@{u}') || up=
+    if [ -z "$pending" ] && [ "$n" -eq 0 ] && [ "$(g rev-parse HEAD)" = "$up" ] \
+        && [ "$(GIT_INDEX_FILE=$idx g write-tree)" = "$(g rev-parse 'HEAD^{tree}')" ]; then
+        echo "claude: nothing to send"
+        return 0
+    fi
+    tree=$(GIT_INDEX_FILE=$idx g write-tree) || return 0
+    # The claude-mem convention: a tip carrying pending memories says so,
+    # which is how recover tells them from kept ones.
+    if [ -n "$pending" ]; then
+        msg="claude-mem stash: unreviewed memories from $name"
+    else
+        msg="claude-state: transcripts from $name"
+    fi
+    commit=$(g commit-tree "$tree" -p HEAD -m "$msg") || return 0
+    if g push -q -f origin "$commit:refs/heads/session/$name" >/dev/null 2>&1; then
+        echo "claude: sent ${pending:+pending memories and }$n transcript(s) to session/$name"
+    else
+        echo "claude: push to session/$name failed; memories and transcripts remain only in this session"
+    fi
+}
+
+usage() {
+    cat <<EOF
+usage: claude-state <command>
+  key [DIR]            print the normalized origin key of DIR (default: this repo)
+  init                 host: create and clone the state remote, then seed
+  seed                 host: publish memories and recent transcripts of ~/.claude/projects
+  pull [--hook]        host: take signed upstream, import session/* branches
+  push [--hook]        host: publish this project's recent transcripts
+  session-activate     session: clone, link memory, import transcripts
+  session-attach       session: rebase onto the remote, import new transcripts
+  session-teardown     session: send memories and transcripts to session/<name>
+repo: $REPO
+EOF
+}
+
+cmd=${1:-}; [ $# -gt 0 ] && shift
+case $cmd in
+    key)              cmd_key "$@" ;;
+    init)             cmd_init ;;
+    seed)             cmd_seed ;;
+    pull)             cmd_pull "$@" ;;
+    push)             cmd_push "$@" ;;
+    session-activate) cmd_session_activate ;;
+    session-attach)   cmd_session_attach ;;
+    session-teardown) cmd_session_teardown ;;
+    -h|--help|help)   usage ;;
+    *) usage >&2; exit 2 ;;
+esac
