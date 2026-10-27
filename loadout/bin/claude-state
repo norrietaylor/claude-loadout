@@ -764,7 +764,9 @@ cmd_session_push() {
         while IFS="$(printf '\t')" read -r r h; do
             GIT_INDEX_FILE=$idx g update-index --add --cacheinfo "100644,$h,$trel/$r" || return 1
         done < "$TMPD/send"
-        tree=$(GIT_INDEX_FILE=$idx g write-tree) || return 1
+        # The index holds all of main, mostly blobs this sparse, blob:none clone
+        # never fetched: without --missing-ok write-tree downloads every one.
+        tree=$(GIT_INDEX_FILE=$idx g write-tree --missing-ok) || return 1
         # Nothing new: the tip already has it all, or there is no branch and
         # HEAD is main (no kept commits to send).
         if [ "$tree" = "$(g rev-parse "$parent^{tree}")" ] && [ -z "$merge" ] \
